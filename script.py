@@ -1,3 +1,54 @@
+# %% [markdown]
+# 
+# # To start
+# 1. download the dataset: https://topbrain2025.grand-challenge.org/data/
+# 2. store the dataset in your google drive folder  `CSE291G`, inside the folder you should have two folders
+# `labelsTr_topbrain_ct/topcow_ct_001_0000.nii.gz"`
+# and
+# `imagesTr_topbrain_ct/topcow_ct_001.nii.gz"`
+# 3. then select GPU in google colab under `notebook setting`
+# 
+
+# %% [markdown]
+# 
+# 
+# #<font color="red"> **The following code is applied to 1 single patient CTA. But we can reuse this code later as python file to process all 29 patient in registration pipeline**</font>
+# 
+# 
+# DiffDRR: https://github.com/eigenvivek/DiffDRR
+# paper: https://arxiv.org/pdf/2208.12737
+# 
+# 
+# DiffPose:  https://github.com/eigenvivek/DiffPose
+# 
+# 
+# It does these steps:
+# 
+# 1. Load the **CTA image** and **multiclass vessel label map**
+# 2. Understand label IDs present in the case
+# 3. <font color="red"> Keep only the **healthy hemisphere** THIS PART IS UNSURE PLEASE CHECK THE CODE</font>
+# 4. Build controlled perturbations:
+#    - **Q1**: image noise after 2D projection
+#    - **Q2**: random vessel-volume loss
+#    - **Q3**: removal of proximal / medium / distal vessel groups
+# 5. Generate a **projection-based pseudo-DSA** for debugging the pipeline
+# 6. Save outputs for later registration experiments
+# 
+# ## Files used
+# 
+# - `topcow_ct_001_0000.nii.gz` → CTA image volume
+# - `topcow_ct_001.nii.gz` → vessel label map
+# 
+
+# %%
+
+# Uncomment once if needed
+# %pip install nibabel matplotlib scipy pandas
+
+
+
+
+# %%
 
 from pathlib import Path
 import json
@@ -12,11 +63,122 @@ import shutil
 from scipy.ndimage import gaussian_filter, rotate, shift, zoom
 from scipy.optimize import minimize
 
+# %%
 
+
+
+# %% [markdown]
+# ## Load the image and label map
+
+# %%
+# drive.mount('/content/drive', force_remount=True)
 import nibabel as nib
 import numpy as np
 
 
+
+# %% [markdown]
+# - ct[x,y,z]
+# - x = left-right
+# - y = front-back
+# - z = slice index
+# - to get one slice: slice = ct[:,:,z]
+# 
+# *  the scan is anisotropic (Z resolution is slightly lower)
+# 
+# 
+# *  the scan covers roughly 14-16 cm of brain volume
+# *   the axis orientation is X axis -> left, Y axis -> posterior, Z axis-> superior
+# 
+# - what it means if X increases, then left shifts, Y increases, back of head, Z increases upward
+# 
+# - **In left right hemisphere occlusion to keep only the healthy hemisphere, we need to split along Axis = 0**
+# 
+# 
+# 
+# - CT intensity range: Hounsfield units (HU)
+# eg.
+# ```
+# Air        ≈ -1000
+# Fat        ≈ -100
+# Water      = 0
+# Brain      ≈ 20–40
+# Bone       ≈ 1000+
+# Contrast   ≈ 200–500
+# ```
+# In our dataset:
+# ```
+# -3024 -> outside scan / padding
+# 3071  -> very dense tissue
+# ```
+# 
+# - Labels: 40 labels, 0 is background. More detailed info in the next cell
+# 
+# 
+# ```
+# # This is formatted as code
+# ```
+# 
+# 
+# 
+# 
+
+# %% [markdown]
+# 
+# ## Label dictionary for TopBrain CTA
+# 
+# The dataset page says the TopBrain CTA labels include 40 classes, with labels 1–12 and 15 inherited from TopCoW.
+# 
+# <font color="purple"> **updated `TOPBRAIN_CTA_LABELS` since the previous one does not match the label order in `itksnap_labelmap_txt\labelmap_topbrain_ct.txt` provided in the dataset**</font>
+# 
+
+# %%
+
+# TOPBRAIN_CTA_LABELS = {
+#     0: 'background',
+#     1: 'BA',
+#     2: 'R-P1P2',
+#     3: 'L-P1P2',
+#     4: 'R-ICA',
+#     5: 'R-M1',
+#     6: 'L-ICA',
+#     7: 'L-M1',
+#     8: 'R-Pcom',
+#     9: 'L-Pcom',
+#     10: 'Acom',
+#     11: 'R-A1A2',
+#     12: 'L-A1A2',
+#     13: '3rd-A2',
+#     14: 'R-A3',
+#     15: 'L-A3',
+#     # The exact TopBrain page contains additional distal / cerebellar / venous labels.
+#     # For the project grouping below, we mainly need clinically meaningful proximal/medium/distal bins.
+#     16: 'R-M2M3',
+#     17: 'L-M2M3',
+#     18: 'R-M4',
+#     19: 'L-M4',
+#     20: 'R-P3P4',
+#     21: 'L-P3P4',
+#     22: 'R-VA',
+#     23: 'L-VA',
+#     24: 'R-SCA',
+#     25: 'L-SCA',
+#     26: 'R-AICA',
+#     27: 'L-AICA',
+#     28: 'R-PICA',
+#     29: 'L-PICA',
+#     30: 'R-AChA',
+#     31: 'L-AChA',
+#     32: 'R-OA',
+#     33: 'L-OA',
+#     34: 'VoG',
+#     35: 'StS',
+#     36: 'R-TS',
+#     37: 'L-TS',
+#     38: 'R-SigS',
+#     39: 'L-SigS',
+#     40: 'SSS',
+# }
 
 TOPBRAIN_CTA_LABELS = {
     0: 'background',
@@ -82,6 +244,22 @@ TOPBRAIN_CTA_LABELS = {
     40: 'SSS'
 }
 
+
+# %% [markdown]
+# ## Quick visualization
+# - visualize one 2D slice from 3D volume and display it with matplot. Show both original CT and its vessel labels
+# - volume: 3D numpy array (CT or label map)
+# - axis: which direction to slice
+# - index: which slice number
+# - cmap: color map
+# - vmin, vmax: intensity range
+# 
+# axis meanings and anatomical direction
+# - axis 0: left <-> right
+# - axis 1: front <-> back
+# - axis 2: bottom <-> top
+# 
+# <font color="purple">(optional) the labels have their colors in the given dataset, we may consider to use them instead of `cmap` </font>
 
 # %%
 
@@ -158,6 +336,12 @@ def keep_single_hemisphere(volume, affine, keep_side='right'):
 
 
 
+# %% [markdown]
+# ## Helper functions
+# 
+# - save_nifti: This function saves a 3D volume as a .nii or .nii.gz medical image file.
+# 
+# 
 
 # %%
 
@@ -187,6 +371,43 @@ def normalize_01(x):
     return (x - mn) / (mx - mn)
 
 
+# %% [markdown]
+# # Pipeline Overview
+
+# %% [markdown]
+# 
+# ```
+# 1. CTA_original
+# 
+# 2. CTA_original + apply transformation T = CTA_transformed
+# 
+# 2. vessel perturbation on CTA_transformed: vessel removal (volume and types): CTA_transformed_pertubated
+# 
+# 3. Render DSA on CTA_transformed_pertubated: DSA_observed
+# 
+# DSA_observed: DSA_original, DSA_removal_volume, DSA_removal_types, DSA_original_noise
+# 
+# 4.
+# CTA_transformed
+# ↓
+# CTA_moving
+# 
+# CTA_moving + DSA_observed and T
+# ↓
+# DiffPose registration
+# ↓
+# recover pose T
+# ↓
+# compute mTRE
+# 
+# ```
+# 
+# 
+
+# %% [markdown]
+# ## Q2 — random vessel-volume loss
+
+# %%
 
 def remove_random_vessel_volume(binary_mask, removal_fraction, seed=0):
     """
@@ -210,6 +431,32 @@ def remove_random_vessel_volume(binary_mask, removal_fraction, seed=0):
 VOLUME_LOSS_LEVELS = [0.10, 0.50, 0.80]
 
 
+# plt.show()
+
+
+# %% [markdown]
+# 
+# ## Q3 — vessel-group removal
+# 
+# defines three groups:
+# 
+# - **proximal / large**: ICA, BA, VA
+# - **medium**: M1, A1/A2, P1/P2
+# - **distal**: M2/M3, A3, P3/P4, 3rd-A3
+# 
+# Below, the groups are written in terms of TopBrain CTA label IDs.
+# The code automatically ignores IDs that are not present in this specific case.
+# 
+
+# %%
+
+# VESSEL_GROUPS = {
+#     'proximal': [1, 4, 6, 22, 23],      # BA, R/L ICA, R/L VA
+#     'medium':   [2, 3, 5, 7, 11, 12],   # P1P2, M1, A1A2
+#     'distal':   [13, 14, 15, 16, 17, 18, 20, 21],  # 3rd-A2, A3, M2M3/M4, P3P4
+# }
+
+#3rd-A2, 3rd-A3
 
 VESSEL_GROUPS = {
     'proximal': [1, 4, 6, 23, 24],      # BA, R/L ICA, R/L VA
@@ -245,6 +492,20 @@ def add_poisson_noise(image, peak=40, seed=0):
     noisy = rng.poisson(scaled) / float(peak)
     return np.clip(noisy, 0.0, 1.0)
 
+# %% [markdown]
+# 
+# 
+# # Benchmark logic
+# 
+# For each scenario:
+# 
+# - the **observed DSA** is rendered from the scenario anatomy (baseline / Q2 / Q3) at the ground-truth pose `T_gt`
+# - the **moving model** used by registration remains the **original healthy model**
+# - pose optimization tries to recover `T_gt`
+# 
+# implement the transform as a **renderer pose** rather than physically storing `CTA_transform = T · CTA`.
+
+# %%
 
 def sample_random_rigid_params(seed=0,
                                tx_range_mm=(-5, 5),
@@ -296,6 +557,17 @@ def apply_rigid_transform_volume(volume, rx_deg=0.0, ry_deg=0.0, rz_deg=0.0,
     return vol
 
 
+
+# %% [markdown]
+# 
+# ## Render DSA
+# 
+# For now we use a **simple projection placeholder** so the perturbation pipeline is correct and easy to debug. don't use diffdrr
+# 
+# 
+# # **<font color='red'> DiffDRR did not work well in our setting because it simulates realistic X-ray physics and expects a full CT attenuation volume containing tissue, bone, and contrast values. Our data, consists only of binary vessel masks where voxels are either vessel or background. Since vessels occupy only a small number of voxels along each X-ray path, the accumulated attenuation is extremely small, which results in very low image contrast and nearly blank projections. </font>**
+# 
+# 
 # 
 
 # %%
@@ -311,6 +583,49 @@ def pseudo_dsa_from_volume_at_pose(binary_or_soft_volume, pose_params,
     moved = gaussian_filter(moved.astype(np.float32), sigma=blur_sigma)
     proj = moved.sum(axis=proj_axis)
     return normalize_01(proj)
+
+# %% [markdown]
+# ## Create observed DSA images at the same ground-truth pose
+# 
+# This is the corrected benchmark construction:
+# 
+# - **baseline observed DSA** comes from the healthy anatomy at `T_gt`
+# - **Q2 observed DSA** comes from the volume-loss anatomy at `T_gt`
+# - **Q3 observed DSA** comes from the group-removed anatomy at `T_gt`
+# - **Q1** adds noise **after projection**
+
+# %%
+# %% [markdown]
+# # Registration with DiffPose-Style Optimization
+# 
+# Replace the Powell optimizer with **gradient-based optimization** following the DiffPose approach:
+# - Use PyTorch for differentiable rendering simulation
+# - Adam optimizer with separate learning rates for rotation and translation
+# - Multiscale NCC loss (local + global)
+# - Learning rate decay for stable convergence
+# 
+# **Reference:** [DiffPose (CVPR 2024)](https://arxiv.org/abs/2312.06358)
+# 
+# **<font color='purple'> Right now the code is a simplified numerical-gradient NCC baseline, not a differentiable DiffPose-style pipeline. </font>**
+# 
+
+# %%
+# =============================================================================
+# TPU Setup (Run this cell ONLY if using TPU runtime)
+# =============================================================================
+# If you're using GPU, skip this cell!
+#
+# For TPU in Colab:
+# 1. Runtime -> Change runtime type -> TPU
+# 2. Run this cell to install torch_xla
+
+# Uncomment the lines below if using TPU:
+
+# !pip install cloud-tpu-client==0.10 torch==2.0.0 torchvision==0.15.1 https://storage.googleapis.com/tpu-pytorch/wheels/colab/torch_xla-2.0-cp310-cp310-linux_x86_64.whl
+
+# import torch_xla
+# import torch_xla.core.xla_model as xm
+# print(f"TPU available: {xm.xla_device()}")
 
 print("TPU setup cell - uncomment lines above if using TPU runtime")
 print("For GPU: Just make sure you selected GPU in Runtime settings")
@@ -330,97 +645,47 @@ print(f"Using device: {device}")
 # Use the EXACT SAME rendering as your original pseudo_dsa_from_volume_at_pose
 # =============================================================================
 # This ensures the optimization target matches the observed image exactly.
-import torch
-import torch.nn.functional as F
-import math
-import torch
-import torch.nn.functional as F
-import math
-def gaussian_kernel_3d(sigma, device):
-    size = int(2*round(3*sigma)+1)
-    x = torch.arange(size, dtype=torch.float32, device=device) - size//2
-    g = torch.exp(-0.5 * (x / sigma) ** 2)
-    g = g / g.sum()
-    g3 = g[:, None, None] * g[None, :, None] * g[None, None, :]
-    return g3.unsqueeze(0).unsqueeze(0)  # shape (1,1,D,H,W)
 
-def render_at_pose_gpu(volume, pose_params, spacing, proj_axis=0, blur_sigma=1.0, device="cuda"):
+def render_at_pose(volume, pose_params, spacing, proj_axis=0, blur_sigma=1.0):
     """
-    GPU version of pseudo-DSA rendering matching CPU behavior.
+    Render pseudo-DSA at given pose - IDENTICAL to pseudo_dsa_from_volume_at_pose.
     """
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    # Ensure volume is a 5D Torch Tensor [1, 1, D, H, W]
-    if not isinstance(volume, torch.Tensor):
-        volume_tensor = torch.from_numpy(volume).float()
+    rx_deg, ry_deg, rz_deg, tx_mm, ty_mm, tz_mm = pose_params
+
+    vol = volume.astype(np.float32).copy()
+
+    # Rotations (same axes convention as scipy.ndimage.rotate)
+    if abs(rx_deg) > 1e-8:
+        vol = rotate(vol, angle=rx_deg, axes=(1, 2), reshape=False, order=1, mode="constant", cval=0.0)
+    if abs(ry_deg) > 1e-8:
+        vol = rotate(vol, angle=ry_deg, axes=(0, 2), reshape=False, order=1, mode="constant", cval=0.0)
+    if abs(rz_deg) > 1e-8:
+        vol = rotate(vol, angle=rz_deg, axes=(0, 1), reshape=False, order=1, mode="constant", cval=0.0)
+
+    # Translation (mm to voxels)
+    shift_vox = (
+        tx_mm / spacing[0],
+        ty_mm / spacing[1],
+        tz_mm / spacing[2],
+    )
+    if max(abs(s) for s in shift_vox) > 1e-8:
+        vol = shift(vol, shift=shift_vox, order=1, mode="constant", cval=0.0)
+
+    # Blur
+    vol = gaussian_filter(vol, sigma=blur_sigma)
+
+    # Project
+    proj = vol.sum(axis=proj_axis)
+
+    # Normalize
+    pmin, pmax = proj.min(), proj.max()
+    if pmax - pmin > 1e-8:
+        proj = (proj - pmin) / (pmax - pmin)
     else:
-        volume_tensor = volume.float()
+        proj = np.zeros_like(proj)
 
-    # Move to GPU if available
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    volume_tensor = volume_tensor.to(device)
+    return proj.astype(np.float32)
 
-    # FIX: Handle dimensions. If [D, H, W], unsqueeze to [1, 1, D, H, W]
-    if volume_tensor.dim() == 3:
-        volume_tensor = volume_tensor.unsqueeze(0).unsqueeze(0)
-    elif volume_tensor.dim() == 4:
-        volume_tensor = volume_tensor.unsqueeze(0)
-
-    rx, ry, rz, tx, ty, tz = [torch.tensor(float(p), device=device) for p in pose_params]
-    
-    # 1. Create Rotation Matrices (XYZ convention)
-    def get_rot_matrix(rx, ry, rz):
-        # Degrees to Radians
-        rx_rad, ry_rad, rz_rad = rx * np.pi / 180, ry * np.pi / 180, rz * np.pi / 180
-        
-        cx, sx = torch.cos(rx_rad), torch.sin(rx_rad)
-        cy, sy = torch.cos(ry_rad), torch.sin(ry_rad)
-        cz, sz = torch.cos(rz_rad), torch.sin(rz_rad)
-        
-        Rx = torch.stack([torch.stack([torch.tensor(1., device=device), torch.tensor(0., device=device), torch.tensor(0., device=device)]),
-                          torch.stack([torch.tensor(0., device=device), cx, -sx]),
-                          torch.stack([torch.tensor(0., device=device), sx, cx])])
-        
-        Ry = torch.stack([torch.stack([cy, torch.tensor(0., device=device), sy]),
-                          torch.stack([torch.tensor(0., device=device), torch.tensor(1., device=device), torch.tensor(0., device=device)]),
-                          torch.stack([-sy, torch.tensor(0., device=device), cy])])
-        
-        Rz = torch.stack([torch.stack([cz, -sz, torch.tensor(0., device=device)]),
-                          torch.stack([sz, cz, torch.tensor(0., device=device)]),
-                          torch.stack([torch.tensor(0., device=device), torch.tensor(0., device=device), torch.tensor(1., device=device)])])
-        
-        return Rz @ Ry @ Rx
-
-    # 2. Build Affine Matrix [R | T]
-    R = get_rot_matrix(rx, ry, rz)
-    
-    # Convert mm translation to normalized coordinate shift [-1, 1]
-    # Note: spacing and dims must match the order of (D, H, W)
-    dims = torch.tensor(volume_tensor.shape[2:], device=device) # [D, H, W]
-    spacing_t = torch.tensor(spacing, device=device)
-    t_norm = (2.0 * torch.stack([tz, ty, tx])) / (spacing_t * dims) # PyTorch uses [z, y, x] internally for grid_sample
-    
-    affine_matrix = torch.zeros((3, 4), device=device)
-    affine_matrix[:, :3] = R
-    affine_matrix[:, 3] = t_norm
-    
-    # 3. Generate grid and sample
-    # volume_tensor.size() is now [1, 1, D, H, W], which is 5D
-    grid = F.affine_grid(affine_matrix.unsqueeze(0), volume_tensor.size(), align_corners=False)
-    moved = F.grid_sample(volume_tensor, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
-    
-    # 4. Project along specified axis
-    # volume_tensor is [B, C, D, H, W], so proj_axis 0, 1, 2 maps to dim 2, 3, 4
-    proj = torch.sum(moved, dim=proj_axis + 2).squeeze()
-    
-    # 5. Normalize [0, 1]
-    p_min, p_max = proj.min(), proj.max()
-    if p_max - p_min > 1e-8:
-        proj = (proj - p_min) / (p_max - p_min)
-    else:
-        proj = torch.zeros_like(proj)
-        
-    return proj.cpu().numpy()
 
 def ncc_numpy(a, b, eps=1e-8):
     """Normalized Cross-Correlation (numpy)."""
@@ -431,23 +696,182 @@ def ncc_numpy(a, b, eps=1e-8):
     denom = np.sqrt((a*a).sum() * (b*b).sum()) + eps
     return float((a*b).sum() / denom)
 
-def ncc_torch(a, b, eps=1e-8):
-    # Flatten
-    if isinstance(a, np.ndarray):
-        a = torch.from_numpy(a).float().to(device)
+#Q1: compare MI and masked NCC under degraded images.
+def masked_ncc_numpy(a, b, mask=None, eps=1e-8):
+    if mask is None:
+        mask = np.ones_like(a, dtype=bool)
+    av = a[mask].astype(np.float64)
+    bv = b[mask].astype(np.float64)
+    av = av - av.mean()
+    bv = bv - bv.mean()
+    denom = np.sqrt((av * av).sum() * (bv * bv).sum()) + eps
+    return float((av * bv).sum() / denom)
 
-    # Ensure b is a numpy array
-    if isinstance(b, np.ndarray):
-        b = torch.from_numpy(b).float().to(device)
 
-    a = a.reshape(-1)
-    b = b.reshape(-1)
-    # Zero-mean
-    a = a - torch.mean(a)
-    b = b - torch.mean(b)
-    # Correlation
-    return torch.sum(a * b) / (torch.sqrt(torch.sum(a**2) * torch.sum(b**2)) + eps)
+# =============================================================================
+# Gradient-Based Optimization with Numerical Gradients
+# =============================================================================
 
+# def compute_numerical_gradient(volume, current_params, observed, spacing, proj_axis,
+#                                 eps_rot=0.1, eps_trans=0.1):
+#     """
+#     Compute gradient using finite differences.
+#     This guarantees we use the exact same rendering as the target.
+#     """
+#     grad = np.zeros(6, dtype=np.float64)
+#     base_ncc = ncc_numpy(render_at_pose(volume, current_params, spacing, proj_axis), observed)
+
+#     for i in range(6):
+#         params_plus = current_params.copy()
+#         eps = eps_rot if i < 3 else eps_trans
+#         params_plus[i] += eps
+
+#         ncc_plus = ncc_numpy(render_at_pose(volume, params_plus, spacing, proj_axis), observed)
+#         grad[i] = (ncc_plus - base_ncc) / eps
+
+#     return grad, base_ncc
+
+
+# def run_diffpose_registration(
+#     moving_volume,
+#     observed_dsa,
+#     init_params=None,
+#     spacing=(1.0, 1.0, 1.0),
+#     proj_axis=0,
+#     n_iters=150,
+#     lr_rot=0.3,
+#     lr_trans=0.5,
+#     momentum=0.9,
+#     verbose=True,
+# ):
+#     """
+#     Gradient-based registration using numerical gradients.
+
+#     Uses the EXACT same rendering as pseudo_dsa_from_volume_at_pose,
+#     with gradient ascent on NCC.
+#     """
+#     if init_params is None:
+#         init_params = np.zeros(6, dtype=np.float32)
+
+#     params = init_params.copy().astype(np.float64)
+#     velocity = np.zeros(6, dtype=np.float64)
+
+#     best_ncc = -float('inf')
+#     best_params = params.copy()
+#     ncc_history = []
+
+#     # Learning rates: [rot, rot, rot, trans, trans, trans]
+#     lrs = np.array([lr_rot, lr_rot, lr_rot, lr_trans, lr_trans, lr_trans], dtype=np.float64)
+
+#     iterator = tqdm(range(n_iters), desc="DiffPose", disable=not verbose)
+
+#     for i in iterator:
+#         # Compute gradient
+#         grad, current_ncc = compute_numerical_gradient(
+#             moving_volume, params, observed_dsa, spacing, proj_axis
+#         )
+
+#         ncc_history.append(current_ncc)
+
+#         # Update best
+#         if current_ncc > best_ncc:
+#             best_ncc = current_ncc
+#             best_params = params.copy()
+
+#         # Momentum update (gradient ascent - maximize NCC)
+#         velocity = momentum * velocity + lrs * grad
+#         params = params + velocity
+
+#         if verbose:
+#             iterator.set_postfix({'NCC': f'{current_ncc:.4f}', 'best': f'{best_ncc:.4f}'})
+
+#         # Early stopping
+#         if best_ncc > 0.99:
+#             if verbose:
+#                 print(f"Converged at iter {i}")
+#             break
+
+#     # Final render
+#     pred_dsa = render_at_pose(moving_volume, best_params, spacing, proj_axis)
+
+#     return {
+#         'pred_params': best_params.astype(np.float32),
+#         'pred_dsa': pred_dsa,
+#         'best_ncc': best_ncc,
+#         'ncc_history': ncc_history,
+#     }
+
+
+# def run_diffpose_multistart(
+#     moving_volume,
+#     observed_dsa,
+#     spacing=(1.0, 1.0, 1.0),
+#     proj_axis=0,
+#     n_restarts=5,
+#     n_iters=100,
+#     verbose=True,
+# ):
+#     """
+#     Multi-start registration to avoid local minima.
+#     """
+#     best_result = None
+#     best_ncc = -float('inf')
+
+#     # Starting points
+#     init_points = [np.zeros(6, dtype=np.float32)]
+
+#     np.random.seed(42)
+#     for _ in range(n_restarts - 1):
+#         rot_init = np.random.uniform(-3, 3, 3).astype(np.float32)
+#         trans_init = np.random.uniform(-3, 3, 3).astype(np.float32)
+#         init_points.append(np.concatenate([rot_init, trans_init]))
+
+#     for idx, init_params in enumerate(init_points):
+#         if verbose:
+#             print(f"\n--- Restart {idx+1}/{n_restarts} ---")
+
+#         result = run_diffpose_registration(
+#             moving_volume=moving_volume,
+#             observed_dsa=observed_dsa,
+#             init_params=init_params,
+#             spacing=spacing,
+#             proj_axis=proj_axis,
+#             n_iters=n_iters,
+#             verbose=verbose,
+#         )
+
+#         if result['best_ncc'] > best_ncc:
+#             best_ncc = result['best_ncc']
+#             best_result = result
+#             if verbose:
+#                 print(f"★ New best NCC: {best_ncc:.4f}")
+
+#     return best_result
+
+
+# def summarize_pose_error(pred_params, gt_params):
+#     """Compute registration error."""
+#     pred = np.asarray(pred_params, dtype=np.float32)
+#     gt = np.asarray(gt_params, dtype=np.float32)
+#     diff = pred - gt
+#     return {
+#         "rot_err_deg_l2": float(np.linalg.norm(diff[:3])),
+#         "trans_err_mm_l2": float(np.linalg.norm(diff[3:])),
+#         "param_diff": diff,
+#     }
+
+
+# print("DiffPose registration with numerical gradients defined.")
+# print("This uses the EXACT same rendering as pseudo_dsa_from_volume_at_pose.")
+
+# %% [markdown]
+# #**<font color='purple'> Refactor the Gradient-Based Optimization code.</font>**
+# 
+# **<font color='purple'> - update `finite_difference_gradient()`: less biased and usually much more stable around local optima.</font>**
+# 
+# **<font color='purple'> - add simple clipping after each update.</font>**
+# 
+# **<font color='purple'> - add gradient decay. (commented out, this seems to reduce perfermance)</font>**
 
 # %%
 from dataclasses import dataclass
@@ -511,12 +935,12 @@ def render_projection(volume, pose, spacing=(1.0, 1.0, 1.0), proj_axis=0):
     """
     if isinstance(pose, PoseParams):
         pose = pose.as_array()
-    return render_at_pose_gpu(volume, pose, spacing, proj_axis)
+    return render_at_pose(volume, pose, spacing, proj_axis)
 
 
 def compute_similarity(pred_image, observed_image, metric="ncc"):
     if metric == "ncc":
-        return ncc_torch(pred_image, observed_image)
+        return ncc_numpy(pred_image, observed_image)
     raise ValueError(f"Unknown metric: {metric}")
 
 
@@ -532,6 +956,20 @@ def make_score_function(problem: RegistrationProblem, metric="ncc"):
         return compute_similarity(pred, problem.observed_image, metric=metric)
     return score_fn
 
+
+# def finite_difference_gradient(score_fn, params, eps_rot=0.1, eps_trans=0.1):
+#     grad = np.zeros(6, dtype=np.float64)
+#     base_score = score_fn(params)
+
+#     for i in range(6):
+#         p = params.copy()
+#         eps = eps_rot if i < 3 else eps_trans
+#         p[i] += eps
+#         grad[i] = (score_fn(p) - base_score) / eps
+
+#     return grad, base_score
+
+# new finite_difference_gradient: less biased and usually much more stable around local optima.
 def finite_difference_gradient(score_fn, params, eps_rot=0.1, eps_trans=0.1, method="central"):
     grad = np.zeros(6, dtype=np.float64)
     base_score = score_fn(params)
@@ -739,6 +1177,16 @@ def summarize_pose_error(pred_params, gt_params):
 
 
 print("Refactored registration API defined.")
+
+# %% [markdown]
+# **<font color='purple'> `multiscale_register` (replace the old `register_single_start`)</font>**
+# 
+# 
+# Because renderer is blur + projection, can stabilize registration by optimizing at several blur/downsample levels.
+# Use three stages:
+# - coarse: downsample 0.25, blur 2.0
+# - medium: downsample 0.5, blur 1.0
+# - fine: full or 0.5, blur 0.5
 
 # %%
 def multiscale_register(problem, metric="ncc", verbose=True):
@@ -989,7 +1437,7 @@ def run_benchmark_cases(case_dict, moving_model=None, init_params=None,
 # =============================================================================
 
 
-path = "TopBrain_Data_Release_Batches1n2_081425"
+path = "/Users/yanran/Documents/school/CSE291G/Project/TopBrain_Data_Release_Batches1n2_081425"
 #/content/drive/MyDrive/CSE291G
 label_path = Path(path+'/labelsTr_topbrain_ct/')
 input_path = Path(path+'/imagesTr_topbrain_ct/')
@@ -1152,7 +1600,7 @@ for index in range(27):
         healthy_binary_ds, T_gt, proj_axis=PROJ_AXIS, blur_sigma=1.0, spacing=spacing_ds
     )
 
-    GAUSSIAN_SIGMAS = [0.01]#, 0.05, 0.10]
+    GAUSSIAN_SIGMAS = [0.01, 0.05, 0.10]
     POISSON_PEAKS = [20, 40, 80]
 
     q1_gaussian_dsas = {sigma: add_gaussian_noise(baseline_dsa_obs, sigma=sigma, seed=42) for sigma in GAUSSIAN_SIGMAS}
@@ -1191,7 +1639,59 @@ for index in range(27):
     print(f"Ground truth params: {T_gt}")
 
     # First verify rendering matches
+    test_render = render_at_pose(healthy_binary_ds, T_gt, spacing_ds, PROJ_AXIS)
+    match_ncc = ncc_numpy(test_render, baseline_dsa_obs)
+    print(f"Verification - NCC between GT render and observed: {match_ncc:.6f}")
+    print("(Should be ~1.0 if rendering matches)")
 
+    baseline_problem = RegistrationProblem(
+        moving_volume=healthy_binary_ds,
+        observed_image=baseline_dsa_obs,
+        spacing=spacing_ds,
+        proj_axis=PROJ_AXIS,
+    )
+
+    baseline_reg = register_multistart(
+        problem=baseline_problem,
+        n_restarts=1,
+        metric="ncc",
+        optimizer_config=OptimizerConfig(n_iters=100),
+        verbose=True,
+    )
+
+    baseline_err = summarize_pose_error(baseline_reg.pred_pose, T_gt)
+
+    print("\n" + "=" * 60)
+    print("BASELINE REGISTRATION RESULTS")
+    print("=" * 60)
+    print(f"GT params       : {T_gt}")
+    print(f"Recovered params: {baseline_reg.pred_pose.as_array()}")
+    print(f"Best NCC        : {baseline_reg.best_score:.4f}")
+    print(f"Rotation error (deg): {baseline_err['rot_err_deg_l2']:.4f}")
+    print(f"Translation error (mm): {baseline_err['trans_err_mm_l2']:.4f}")
+
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+
+    axes[0].imshow(baseline_dsa_obs, cmap="gray")
+    axes[0].set_title("Observed DSA\n(Ground Truth)")
+    axes[0].axis("off")
+
+    axes[1].imshow(baseline_reg.pred_image, cmap="gray")
+    axes[1].set_title(f"Recovered\nNCC={baseline_reg.best_score:.3f}")
+    axes[1].axis("off")
+
+    axes[2].imshow(np.abs(baseline_dsa_obs - baseline_reg.pred_image), cmap="hot")
+    axes[2].set_title("Difference")
+    axes[2].axis("off")
+
+    axes[3].plot(baseline_reg.score_history)
+    axes[3].set_xlabel("Iteration")
+    axes[3].set_ylabel("NCC")
+    axes[3].set_title("Convergence")
+    axes[3].grid(True)
+
+    plt.tight_layout()
+    # plt.show()
     print("Running Q1 Gaussian noise benchmark (DiffPose)...")
 
     q1_gaussian_table, q1_gaussian_preds = run_benchmark_cases(
@@ -1314,3 +1814,5 @@ for index in range(27):
     # plt.show()
 
     print(f"Figure saved to {OUT_DIR}/{index_str}_registration_errors_diffpose.png")
+
+
