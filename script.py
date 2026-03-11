@@ -330,86 +330,56 @@ print(f"Using device: {device}")
 # Use the EXACT SAME rendering as your original pseudo_dsa_from_volume_at_pose
 # =============================================================================
 # This ensures the optimization target matches the observed image exactly.
-import torch
-import torch.nn.functional as F
-import math
 
-def render_at_pose_gpu(volume, pose_params, spacing, proj_axis=0, blur_sigma=1.0, device="cuda"):
-    
-    rx, ry, rz, tx, ty, tz = pose_params
-    
-    vol = torch.tensor(volume, dtype=torch.float32, device=device)
-    vol = vol.unsqueeze(0).unsqueeze(0)  # (1,1,D,H,W)
+def render_at_pose(volume, pose_params, spacing, proj_axis=0, blur_sigma=1.0):
+    """
+    Render pseudo-DSA at given pose - IDENTICAL to pseudo_dsa_from_volume_at_pose.
+    """
+    rx_deg, ry_deg, rz_deg, tx_mm, ty_mm, tz_mm = pose_params
 
-    # Convert translation mm -> normalized grid coords
-    shift = torch.tensor([
-        tx / spacing[0],
-        ty / spacing[1],
-        tz / spacing[2]
-    ], device=device)
+    vol = volume.astype(np.float32).copy()
 
-    # D, H, W = volume.shape
+    # Rotations (same axes convention as scipy.ndimage.rotate)
+    if abs(rx_deg) > 1e-8:
+        vol = rotate(vol, angle=rx_deg, axes=(1, 2), reshape=False, order=1, mode="constant", cval=0.0)
+    if abs(ry_deg) > 1e-8:
+        vol = rotate(vol, angle=ry_deg, axes=(0, 2), reshape=False, order=1, mode="constant", cval=0.0)
+    if abs(rz_deg) > 1e-8:
+        vol = rotate(vol, angle=rz_deg, axes=(0, 1), reshape=False, order=1, mode="constant", cval=0.0)
 
-    # Rotation matrices
-    rx = math.radians(rx)
-    ry = math.radians(ry)
-    rz = math.radians(rz)
+    # Translation (mm to voxels)
+    shift_vox = (
+        tx_mm / spacing[0],
+        ty_mm / spacing[1],
+        tz_mm / spacing[2],
+    )
+    if max(abs(s) for s in shift_vox) > 1e-8:
+        vol = shift(vol, shift=shift_vox, order=1, mode="constant", cval=0.0)
 
-    Rx = torch.tensor([
-        [1,0,0],
-        [0,math.cos(rx),-math.sin(rx)],
-        [0,math.sin(rx), math.cos(rx)]
-    ], device=device)
+    # Blur
+    vol = gaussian_filter(vol, sigma=blur_sigma)
 
-    Ry = torch.tensor([
-        [ math.cos(ry),0,math.sin(ry)],
-        [0,1,0],
-        [-math.sin(ry),0,math.cos(ry)]
-    ], device=device)
-
-    Rz = torch.tensor([
-        [math.cos(rz),-math.sin(rz),0],
-        [math.sin(rz), math.cos(rz),0],
-        [0,0,1]
-    ], device=device)
-
-    R = Rz @ Ry @ Rx
-
-    # affine matrix
-    affine = torch.eye(4, device=device)
-    affine[:3,:3] = R
-    affine[:3,3] = shift
-
-    affine = affine[:3].unsqueeze(0)
-
-    grid = F.affine_grid(affine, vol.size(), align_corners=False)
-    vol = F.grid_sample(vol, grid, mode="bilinear", padding_mode="zeros")
-
-    # Gaussian blur (approx)
-    if blur_sigma > 0:
-        vol = F.avg_pool3d(vol, kernel_size=3, stride=1, padding=1)
-
-    # Projection
-    proj = vol.sum(dim=2 + proj_axis)
-
-    proj = proj.squeeze()
+    # Project
+    proj = vol.sum(axis=proj_axis)
 
     # Normalize
-    proj = (proj - proj.min()) / (proj.max() - proj.min() + 1e-8)
+    pmin, pmax = proj.min(), proj.max()
+    if pmax - pmin > 1e-8:
+        proj = (proj - pmin) / (pmax - pmin)
+    else:
+        proj = np.zeros_like(proj)
 
-    return proj.cpu().numpy()
+    return proj.astype(np.float32)
 
-def ncc_torch(a, b, eps=1e-8):
-    # Flatten
-    a = torch.from_numpy( a).float().to(device)
-    b = torch.from_numpy( b).float().to(device)
-    a = a.reshape(-1)
-    b = b.reshape(-1)
-    # Zero-mean
-    a = a - torch.mean(a)
-    b = b - torch.mean(b)
-    # Correlation
-    return torch.sum(a * b) / (torch.sqrt(torch.sum(a**2) * torch.sum(b**2)) + eps)
+
+def ncc_numpy(a, b, eps=1e-8):
+    """Normalized Cross-Correlation (numpy)."""
+    a = a.astype(np.float64).flatten()
+    b = b.astype(np.float64).flatten()
+    a = a - a.mean()
+    b = b - b.mean()
+    denom = np.sqrt((a*a).sum() * (b*b).sum()) + eps
+    return float((a*b).sum() / denom)
 
 
 # %%
@@ -474,12 +444,12 @@ def render_projection(volume, pose, spacing=(1.0, 1.0, 1.0), proj_axis=0):
     """
     if isinstance(pose, PoseParams):
         pose = pose.as_array()
-    return render_at_pose_gpu(volume, pose, spacing, proj_axis)
+    return render_at_pose(volume, pose, spacing, proj_axis)
 
 
 def compute_similarity(pred_image, observed_image, metric="ncc"):
     if metric == "ncc":
-        return ncc_torch(pred_image, observed_image)
+        return ncc_numpy(pred_image, observed_image)
     raise ValueError(f"Unknown metric: {metric}")
 
 
@@ -495,6 +465,20 @@ def make_score_function(problem: RegistrationProblem, metric="ncc"):
         return compute_similarity(pred, problem.observed_image, metric=metric)
     return score_fn
 
+
+# def finite_difference_gradient(score_fn, params, eps_rot=0.1, eps_trans=0.1):
+#     grad = np.zeros(6, dtype=np.float64)
+#     base_score = score_fn(params)
+
+#     for i in range(6):
+#         p = params.copy()
+#         eps = eps_rot if i < 3 else eps_trans
+#         p[i] += eps
+#         grad[i] = (score_fn(p) - base_score) / eps
+
+#     return grad, base_score
+
+# new finite_difference_gradient: less biased and usually much more stable around local optima.
 def finite_difference_gradient(score_fn, params, eps_rot=0.1, eps_trans=0.1, method="central"):
     grad = np.zeros(6, dtype=np.float64)
     base_score = score_fn(params)
@@ -952,7 +936,7 @@ def run_benchmark_cases(case_dict, moving_model=None, init_params=None,
 # =============================================================================
 
 
-path = "TopBrain_Data_Release_Batches1n2_081425"
+path = "/Users/yanran/Documents/school/CSE291G/Project/TopBrain_Data_Release_Batches1n2_081425"
 #/content/drive/MyDrive/CSE291G
 label_path = Path(path+'/labelsTr_topbrain_ct/')
 input_path = Path(path+'/imagesTr_topbrain_ct/')
@@ -1154,7 +1138,59 @@ for index in range(27):
     print(f"Ground truth params: {T_gt}")
 
     # First verify rendering matches
+    test_render = render_at_pose(healthy_binary_ds, T_gt, spacing_ds, PROJ_AXIS)
+    match_ncc = ncc_numpy(test_render, baseline_dsa_obs)
+    print(f"Verification - NCC between GT render and observed: {match_ncc:.6f}")
+    print("(Should be ~1.0 if rendering matches)")
 
+    baseline_problem = RegistrationProblem(
+        moving_volume=healthy_binary_ds,
+        observed_image=baseline_dsa_obs,
+        spacing=spacing_ds,
+        proj_axis=PROJ_AXIS,
+    )
+
+    baseline_reg = register_multistart(
+        problem=baseline_problem,
+        n_restarts=1,
+        metric="ncc",
+        optimizer_config=OptimizerConfig(n_iters=100),
+        verbose=True,
+    )
+
+    baseline_err = summarize_pose_error(baseline_reg.pred_pose, T_gt)
+
+    print("\n" + "=" * 60)
+    print("BASELINE REGISTRATION RESULTS")
+    print("=" * 60)
+    print(f"GT params       : {T_gt}")
+    print(f"Recovered params: {baseline_reg.pred_pose.as_array()}")
+    print(f"Best NCC        : {baseline_reg.best_score:.4f}")
+    print(f"Rotation error (deg): {baseline_err['rot_err_deg_l2']:.4f}")
+    print(f"Translation error (mm): {baseline_err['trans_err_mm_l2']:.4f}")
+
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+
+    axes[0].imshow(baseline_dsa_obs, cmap="gray")
+    axes[0].set_title("Observed DSA\n(Ground Truth)")
+    axes[0].axis("off")
+
+    axes[1].imshow(baseline_reg.pred_image, cmap="gray")
+    axes[1].set_title(f"Recovered\nNCC={baseline_reg.best_score:.3f}")
+    axes[1].axis("off")
+
+    axes[2].imshow(np.abs(baseline_dsa_obs - baseline_reg.pred_image), cmap="hot")
+    axes[2].set_title("Difference")
+    axes[2].axis("off")
+
+    axes[3].plot(baseline_reg.score_history)
+    axes[3].set_xlabel("Iteration")
+    axes[3].set_ylabel("NCC")
+    axes[3].set_title("Convergence")
+    axes[3].grid(True)
+
+    plt.tight_layout()
+    # plt.show()
     print("Running Q1 Gaussian noise benchmark (DiffPose)...")
 
     q1_gaussian_table, q1_gaussian_preds = run_benchmark_cases(
