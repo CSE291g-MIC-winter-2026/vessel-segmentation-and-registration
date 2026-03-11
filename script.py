@@ -1,3 +1,54 @@
+# %% [markdown]
+# 
+# # To start
+# 1. download the dataset: https://topbrain2025.grand-challenge.org/data/
+# 2. store the dataset in your google drive folder  `CSE291G`, inside the folder you should have two folders
+# `labelsTr_topbrain_ct/topcow_ct_001_0000.nii.gz"`
+# and
+# `imagesTr_topbrain_ct/topcow_ct_001.nii.gz"`
+# 3. then select GPU in google colab under `notebook setting`
+# 
+
+# %% [markdown]
+# 
+# 
+# #<font color="red"> **The following code is applied to 1 single patient CTA. But we can reuse this code later as python file to process all 29 patient in registration pipeline**</font>
+# 
+# 
+# DiffDRR: https://github.com/eigenvivek/DiffDRR
+# paper: https://arxiv.org/pdf/2208.12737
+# 
+# 
+# DiffPose:  https://github.com/eigenvivek/DiffPose
+# 
+# 
+# It does these steps:
+# 
+# 1. Load the **CTA image** and **multiclass vessel label map**
+# 2. Understand label IDs present in the case
+# 3. <font color="red"> Keep only the **healthy hemisphere** THIS PART IS UNSURE PLEASE CHECK THE CODE</font>
+# 4. Build controlled perturbations:
+#    - **Q1**: image noise after 2D projection
+#    - **Q2**: random vessel-volume loss
+#    - **Q3**: removal of proximal / medium / distal vessel groups
+# 5. Generate a **projection-based pseudo-DSA** for debugging the pipeline
+# 6. Save outputs for later registration experiments
+# 
+# ## Files used
+# 
+# - `topcow_ct_001_0000.nii.gz` → CTA image volume
+# - `topcow_ct_001.nii.gz` → vessel label map
+# 
+
+# %%
+
+# Uncomment once if needed
+# %pip install nibabel matplotlib scipy pandas
+
+
+
+
+# %%
 
 from pathlib import Path
 import json
@@ -384,68 +435,110 @@ print(f"Using device: {device}")
 # Use the EXACT SAME rendering as your original pseudo_dsa_from_volume_at_pose
 # =============================================================================
 # This ensures the optimization target matches the observed image exactly.
-def build_affine_matrix(pose_params, device):
+def build_affine_matrix(pose_params, vol_shape, device):
+    """
+    Constructs a 3x4 affine matrix for PyTorch grid_sample.
+    pose_params: [rx, ry, rz, tx, ty, tz]
+    vol_shape: (D, H, W)
+    """
+    # 1. Convert angles to radians
+    ax = torch.deg2rad(pose_params[0])
+    ay = torch.deg2rad(pose_params[1])
+    az = torch.deg2rad(pose_params[2])
 
-    rx, ry, rz = torch.deg2rad(pose_params[0]), torch.deg2rad(pose_params[1]), torch.deg2rad(pose_params[2])
-    tx, ty, tz = pose_params[3], pose_params[4], pose_params[5]
+    # 2. Create 3x3 Rotation Matrices
+    # Rotation around X
+    Rx = torch.tensor([
+        [1, 0, 0],
+        [0, torch.cos(ax), -torch.sin(ax)],
+        [0, torch.sin(ax), torch.cos(ax)]
+    ], device=device, dtype=torch.float32)
 
-    one = torch.ones((), device=device)
-    zero = torch.zeros((), device=device)
+    # Rotation around Y
+    Ry = torch.tensor([
+        [torch.cos(ay), 0, torch.sin(ay)],
+        [0, 1, 0],
+        [-torch.sin(ay), 0, torch.cos(ay)]
+    ], device=device, dtype=torch.float32)
 
-    Rx = torch.stack([
-        torch.stack([one, zero, zero]),
-        torch.stack([zero, torch.cos(rx), -torch.sin(rx)]),
-        torch.stack([zero, torch.sin(rx), torch.cos(rx)])
-    ])
+    # Rotation around Z
+    Rz = torch.tensor([
+        [torch.cos(az), -torch.sin(az), 0],
+        [torch.sin(az), torch.cos(az), 0],
+        [0, 0, 1]
+    ], device=device, dtype=torch.float32)
 
-    Ry = torch.stack([
-        torch.stack([torch.cos(ry), zero, torch.sin(ry)]),
-        torch.stack([zero, one, zero]),
-        torch.stack([-torch.sin(ry), zero, torch.cos(ry)])
-    ])
-
-    Rz = torch.stack([
-        torch.stack([torch.cos(rz), -torch.sin(rz), zero]),
-        torch.stack([torch.sin(rz), torch.cos(rz), zero]),
-        torch.stack([zero, zero, one])
-    ])
-
+    # Combined Rotation: R = Rz @ Ry @ Rx
     R = Rz @ Ry @ Rx
 
-    t = torch.stack([tx, ty, tz]).unsqueeze(1)
+    # 3. Translation Normalization (CRITICAL FOR ACCURACY)
+    # Convert mm -> voxels -> normalized [-1, 1] range
+    # Ensure 'spacing' is defined globally (e.g. spacing = [1.0, 1.0, 1.0])
+    tx = (2.0 * pose_params[3] / spacing[0]) / (vol_shape[2] - 1)
+    ty = (2.0 * pose_params[4] / spacing[1]) / (vol_shape[1] - 1)
+    tz = (2.0 * pose_params[5] / spacing[2]) / (vol_shape[0] - 1)
 
-    return torch.cat([R, t], dim=1).unsqueeze(0)
+    # 4. Combine into 3x4 Matrix
+    # PyTorch expects the translation in the last column
+    t = torch.stack([tx, ty, tz]).unsqueeze(1)
+    affine_mat = torch.cat([R, t], dim=1).unsqueeze(0) # Shape (1, 3, 4)
+
+    return affine_mat
+# def build_affine_matrix(pose_params, device):
+
+#     rx, ry, rz = torch.deg2rad(pose_params[0]), torch.deg2rad(pose_params[1]), torch.deg2rad(pose_params[2])
+#     tx, ty, tz = pose_params[3], pose_params[4], pose_params[5]
+
+#     one = torch.ones((), device=device)
+#     zero = torch.zeros((), device=device)
+
+#     Rx = torch.stack([
+#         torch.stack([one, zero, zero]),
+#         torch.stack([zero, torch.cos(rx), -torch.sin(rx)]),
+#         torch.stack([zero, torch.sin(rx), torch.cos(rx)])
+#     ])
+
+#     Ry = torch.stack([
+#         torch.stack([torch.cos(ry), zero, torch.sin(ry)]),
+#         torch.stack([zero, one, zero]),
+#         torch.stack([-torch.sin(ry), zero, torch.cos(ry)])
+#     ])
+
+#     Rz = torch.stack([
+#         torch.stack([torch.cos(rz), -torch.sin(rz), zero]),
+#         torch.stack([torch.sin(rz), torch.cos(rz), zero]),
+#         torch.stack([zero, zero, one])
+#     ])
+
+#     R = Rz @ Ry @ Rx
+
+#     t = torch.stack([tx, ty, tz]).unsqueeze(1)
+
+#     return torch.cat([R, t], dim=1).unsqueeze(0)
 
 def render_at_pose_gpu(volume_tensor, pose_params, proj_axis=0):
-    """
-    Differentiable-ready GPU projector.
-    """
+    # ... volume_tensor setup ...
     if isinstance(volume_tensor, np.ndarray):
         volume_tensor = torch.from_numpy(volume_tensor).float().to(device)
-    else:
-        volume_tensor = volume_tensor
+    
+    # 2. ENSURE POSE PARAMS ARE TENSORS
     if isinstance(pose_params, np.ndarray):
         pose_params = torch.from_numpy(pose_params).float().to(device)
-    else:
-        pose_params = pose_params
-
-
+        
     if volume_tensor.ndim == 3:
         volume_tensor = volume_tensor.unsqueeze(0).unsqueeze(0)
-    elif volume_tensor.ndim == 4:
-        volume_tensor = volume_tensor.unsqueeze(0)
-
     B, C, D, H, W = volume_tensor.shape
-    affine_mat = build_affine_matrix(pose_params, volume_tensor.device)
     
-    # Grid generation and sampling
+    # Pass shape to the updated matrix builder
+    affine_mat = build_affine_matrix(pose_params, (D, H, W), volume_tensor.device)
+    
     grid = F.affine_grid(affine_mat, [B, C, D, H, W], align_corners=False)
     moved = F.grid_sample(volume_tensor, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
     
-    # Sum projection along the chosen axis (D=0, H=1, W=2)
+    # Sum along the projection axis (accounting for B and C dims)
     proj = torch.sum(moved, dim=proj_axis + 2)
     
-    # Min-Max Normalization
+    # Standardize normalization to match CPU's normalize_01
     p_min, p_max = proj.min(), proj.max()
     return (proj - p_min) / (p_max - p_min + 1e-8)
 
@@ -1217,7 +1310,8 @@ for index in range(27):
 
     print("Running registration on baseline...")
     print(f"Ground truth params: {T_gt}")
-
+    # healthy_binary_ds = torch.from_numpy(healthy_binary_ds).float().to(device)
+    # T_gt = torch.from_numpy(T_gt).float().to(device)
     # First verify rendering matches
     test_render = render_at_pose_gpu(healthy_binary_ds, T_gt, PROJ_AXIS)
     baseline_dsa_obs  = torch.tensor(baseline_dsa_obs, device=device, dtype=torch.float32)
