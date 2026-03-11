@@ -1567,7 +1567,7 @@ def run_benchmark_cases(case_dict, moving_model=None, init_params=None,
 # =============================================================================
 
 
-path = "/Users/yanran/Documents/school/CSE291G/Project/TopBrain_Data_Release_Batches1n2_081425"
+path = "TopBrain_Data_Release_Batches1n2_081425"
 #/content/drive/MyDrive/CSE291G
 label_path = Path(path+'/labelsTr_topbrain_ct/')
 input_path = Path(path+'/imagesTr_topbrain_ct/')
