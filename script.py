@@ -59,7 +59,7 @@ import nibabel as nib
 import matplotlib.pyplot as plt
 import gzip
 import shutil
-
+import torch.nn.functional as F
 from scipy.ndimage import gaussian_filter, rotate, shift, zoom
 from scipy.optimize import minimize
 
@@ -689,12 +689,31 @@ def render_at_pose(volume, pose_params, spacing, proj_axis=0, blur_sigma=1.0):
 
 def ncc_numpy(a, b, eps=1e-8):
     """Normalized Cross-Correlation (numpy)."""
-    a = a.astype(np.float64).flatten()
-    b = b.astype(np.float64).flatten()
+    a = a.flatten()
+    b = b.flatten()
     a = a - a.mean()
     b = b - b.mean()
     denom = np.sqrt((a*a).sum() * (b*b).sum()) + eps
     return float((a*b).sum() / denom)
+def ncc_torch(a, b, eps=1e-8):
+    """Normalized Cross-Correlation using PyTorch (GPU compatible)."""
+    # Flatten and ensure float
+    if isinstance(a, np.ndarray):
+        a = torch.from_numpy(a).to(device)
+    
+    # Convert 'b' to torch tensor if it's numpy
+    if isinstance(b, np.ndarray):
+        b = torch.from_numpy(b).to(device)
+    a = a.reshape(-1).float()
+    b = b.reshape(-1).float()
+    # Zero-mean
+    a = a - a.mean()
+    b = b - b.mean()
+    
+    # Correlation
+    numerator = (a * b).sum()
+    denominator = torch.sqrt((a**2).sum() * (b**2).sum()) + eps
+    return (numerator / denominator).item() # .item() returns a plain Python float
 
 #Q1: compare MI and masked NCC under degraded images.
 def masked_ncc_numpy(a, b, mask=None, eps=1e-8):
@@ -940,7 +959,7 @@ def render_projection(volume, pose, spacing=(1.0, 1.0, 1.0), proj_axis=0):
 
 def compute_similarity(pred_image, observed_image, metric="ncc"):
     if metric == "ncc":
-        return ncc_numpy(pred_image, observed_image)
+        return ncc_torch(pred_image, observed_image)
     raise ValueError(f"Unknown metric: {metric}")
 
 
@@ -1190,22 +1209,40 @@ print("Refactored registration API defined.")
 
 # %%
 def multiscale_register(problem, metric="ncc", verbose=True):
-    # scales = [
-    #     {"downsample": 0.25, "blur_sigma": 2.0, "n_iters": 80},
-    #     {"downsample": 0.50, "blur_sigma": 1.0, "n_iters": 100},
-    #     {"downsample": 1.00, "blur_sigma": 0.5, "n_iters": 120},
-    # ]
+    '''
+    scales = [
+         {"downsample": 0.25, "blur_sigma": 2.0, "n_iters": 1},
+         {"downsample": 0.50, "blur_sigma": 1.0, "n_iters": 1},
+         {"downsample": 1.00, "blur_sigma": 0.5, "n_iters": 1},
+     ]
+    '''
     scales = [
         {"downsample": 0.25, "blur_sigma": 2.0, "n_iters": 24},
         {"downsample": 0.50, "blur_sigma": 1.0, "n_iters": 30},
         {"downsample": 1.00, "blur_sigma": 0.5, "n_iters": 36},
     ]
-
+    
     current_pose = PoseParams()
 
     for stage_id, stage in enumerate(scales, start=1):
         moving_ds = maybe_downsample_volume(problem.moving_volume, stage["downsample"])
-        observed_ds = zoom(problem.observed_image, zoom=stage["downsample"], order=1).astype(np.float32)
+        obs_tensor = problem.observed_image[None, None, ...] 
+
+        observed_ds = F.interpolate(
+             obs_tensor, 
+            scale_factor=stage["downsample"], 
+             mode='bilinear', 
+            align_corners=False
+        ).squeeze() # Remove the extra dimensions back to [H, W]
+        '''
+        temp_np = problem.observed_image.detach().cpu().numpy()
+
+        # Prform the zoom
+        observed_ds_np = zoom(temp_np, zoom=stage["downsample"], order=1).astype(np.float32)
+
+        # Move back to GPU
+        observed_ds = torch.from_numpy(observed_ds_np).to(device)
+        '''
         spacing_ds = tuple(s / stage["downsample"] for s in problem.spacing)
 
         stage_problem = RegistrationProblem(
@@ -1389,7 +1426,7 @@ def run_benchmark_cases(case_dict, moving_model=None, init_params=None,
     for case_name, observed_dsa in tqdm(case_dict.items(), desc="Benchmark"):
         problem = RegistrationProblem(
             moving_volume=moving_model,
-            observed_image=observed_dsa,
+            observed_image=torch.from_numpy(observed_dsa).float().to(device),
             spacing=spacing_ds,
             proj_axis=PROJ_AXIS,
         )
@@ -1437,11 +1474,11 @@ def run_benchmark_cases(case_dict, moving_model=None, init_params=None,
 # =============================================================================
 
 
-path = "/Users/yanran/Documents/school/CSE291G/Project/TopBrain_Data_Release_Batches1n2_081425"
+path = "TopBrain_Data_Release_Batches1n2_081425"
 #/content/drive/MyDrive/CSE291G
 label_path = Path(path+'/labelsTr_topbrain_ct/')
 input_path = Path(path+'/imagesTr_topbrain_ct/')
-OUT_DIR = Path(path+'/output/'+'/cse291_project_outputs_complete')
+OUT_DIR = Path('output/'+'/cse291_project_outputs_complete')
 OUT_DIR.mkdir(exist_ok=True, parents=True)
 for index in range(27):
     index_str = f"{index+1:03}"
@@ -1451,13 +1488,16 @@ for index in range(27):
     label_name = f"topcow_ct_{index_str}.nii"
     CT_PATH = input_path/ct_name
     LABEL_PATH = label_path/label_name
-    with gzip.open(input_path/ct_zipped_name, 'rb') as f_in:
-        with open(CT_PATH, 'wb') as f_out:
-            shutil.copyfileobj(f_in, f_out)
-    with gzip.open(label_path/label_zipped_name, 'rb') as f_in:
-        with open(LABEL_PATH, 'wb') as f_out:
-            shutil.copyfileobj(f_in, f_out)
-
+    try:
+        with gzip.open(input_path/ct_zipped_name, 'rb') as f_in:
+            with open(CT_PATH, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        with gzip.open(label_path/label_zipped_name, 'rb') as f_in:
+            with open(LABEL_PATH, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+    except FileNotFoundError:
+        print(f"file not found, skipping.")
+        continue  
     print('CT_PATH   =', CT_PATH)
     print('LABEL_PATH=', LABEL_PATH)
     print('OUT_DIR   =', OUT_DIR)
@@ -1640,10 +1680,10 @@ for index in range(27):
 
     # First verify rendering matches
     test_render = render_at_pose(healthy_binary_ds, T_gt, spacing_ds, PROJ_AXIS)
-    match_ncc = ncc_numpy(test_render, baseline_dsa_obs)
+    match_ncc = ncc_torch(test_render, baseline_dsa_obs)
     print(f"Verification - NCC between GT render and observed: {match_ncc:.6f}")
     print("(Should be ~1.0 if rendering matches)")
-
+    '''
     baseline_problem = RegistrationProblem(
         moving_volume=healthy_binary_ds,
         observed_image=baseline_dsa_obs,
@@ -1692,6 +1732,7 @@ for index in range(27):
 
     plt.tight_layout()
     # plt.show()
+    '''
     print("Running Q1 Gaussian noise benchmark (DiffPose)...")
 
     q1_gaussian_table, q1_gaussian_preds = run_benchmark_cases(
@@ -1774,10 +1815,9 @@ for index in range(27):
     ])
 
     # Save to CSV
-    output_csv = OUT_DIR / 'diffpose_registration_results.csv'
+    output_csv = OUT_DIR / f'{index_str}_diffpose_registration_results.csv'
     all_results.to_csv(output_csv, index=False)
-    print(f"\nResults saved to {index_str+output_csv}")
-
+    print(f"\nResults saved to {str(output_csv)}")
     # %%
     # =============================================================================
     # Visualization: Registration Error vs Condition
@@ -1810,9 +1850,10 @@ for index in range(27):
     ax.tick_params(axis='x', rotation=45)
 
     plt.tight_layout()
-    plt.savefig(OUT_DIR / 'registration_errors_diffpose.png', dpi=150, bbox_inches='tight')
+    plt.savefig(OUT_DIR / f'{index_str}_registration_errors_diffpose.png', dpi=150, bbox_inches='tight')
     # plt.show()
 
     print(f"Figure saved to {OUT_DIR}/{index_str}_registration_errors_diffpose.png")
+
 
 
