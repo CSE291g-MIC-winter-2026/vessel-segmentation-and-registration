@@ -645,71 +645,41 @@ print(f"Using device: {device}")
 # Use the EXACT SAME rendering as your original pseudo_dsa_from_volume_at_pose
 # =============================================================================
 # This ensures the optimization target matches the observed image exactly.
-def render_at_pose(volume_tensor, pose_params, spacing, proj_axis=0):
+def build_affine_matrix(pose_params, device):
     """
-    volume_tensor: (1, 1, D, H, W) torch tensor already on GPU
-    pose_params: (6,) tensor [rx, ry, rz, tx, ty, tz]
+    Converts [rx, ry, rz, tx, ty, tz] into a 3x4 Affine Matrix for torch.
+    Note: Standard grid_sample uses normalized coordinates [-1, 1].
     """
-    device = volume_tensor.device
+    rx, ry, rz = torch.deg2rad(pose_params[0]), torch.deg2rad(pose_params[1]), torch.deg2rad(pose_params[2])
+    tx, ty, tz = pose_params[3], pose_params[4], pose_params[5]
+
+    # Rotation matrices
+    Rx = torch.tensor([[1, 0, 0], [0, torch.cos(rx), -torch.sin(rx)], [0, torch.sin(rx), torch.cos(rx)]], device=device)
+    Ry = torch.tensor([[torch.cos(ry), 0, torch.sin(ry)], [0, 1, 0], [-torch.sin(ry), 0, torch.cos(ry)]], device=device)
+    Rz = torch.tensor([[torch.cos(rz), -torch.sin(rz), 0], [torch.sin(rz), torch.cos(rz), 0], [0, 0, 1]], device=device)
+    
+    R = Rz @ Ry @ Rx
+    t = torch.tensor([[tx], [ty], [tz]], device=device)
+    
+    return torch.cat([R, t], dim=1).unsqueeze(0) # Shape (1, 3, 4)
+
+def render_at_pose_gpu(volume_tensor, pose_params, proj_axis=0):
+    """
+    Differentiable-ready GPU projector.
+    """
     B, C, D, H, W = volume_tensor.shape
+    affine_mat = build_affine_matrix(pose_params, volume_tensor.device)
     
-    # 1. Convert pose_params to an Affine Matrix (3x4)
-    # Note: For brevity, use a helper to build the rotation matrix R and translation t
-    # For a deep-dive, see torch.affine_grid documentation
-    affine_matrix = build_affine_matrix(pose_params, device) 
+    # Grid generation and sampling
+    grid = F.affine_grid(affine_mat, [B, C, D, H, W], align_corners=False)
+    moved = F.grid_sample(volume_tensor, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
     
-    # 2. Generate the grid
-    grid = F.affine_grid(affine_matrix, [B, C, D, H, W], align_corners=False)
+    # Sum projection along the chosen axis (D=0, H=1, W=2)
+    proj = torch.sum(moved, dim=proj_axis + 2)
     
-    # 3. Sample the volume (This is the GPU magic)
-    moved_vol = F.grid_sample(volume_tensor, grid, mode='bilinear', align_corners=False)
-    
-    # 4. Project (Sum along axis)
-    proj = moved_vol.sum(dim=proj_axis+2) # +2 because of (B, C) dims
-    
-    # 5. Normalize 0-1
-    proj = (proj - proj.min()) / (proj.max() - proj.min() + 1e-8)
-    return proj
-def render_at_pose_cpu(volume, pose_params, spacing, proj_axis=0, blur_sigma=1.0):
-    """
-    Render pseudo-DSA at given pose - IDENTICAL to pseudo_dsa_from_volume_at_pose.
-    """
-    rx_deg, ry_deg, rz_deg, tx_mm, ty_mm, tz_mm = pose_params
-
-    vol = volume.astype(np.float32).copy()
-
-    # Rotations (same axes convention as scipy.ndimage.rotate)
-    if abs(rx_deg) > 1e-8:
-        vol = rotate(vol, angle=rx_deg, axes=(1, 2), reshape=False, order=1, mode="constant", cval=0.0)
-    if abs(ry_deg) > 1e-8:
-        vol = rotate(vol, angle=ry_deg, axes=(0, 2), reshape=False, order=1, mode="constant", cval=0.0)
-    if abs(rz_deg) > 1e-8:
-        vol = rotate(vol, angle=rz_deg, axes=(0, 1), reshape=False, order=1, mode="constant", cval=0.0)
-
-    # Translation (mm to voxels)
-    shift_vox = (
-        tx_mm / spacing[0],
-        ty_mm / spacing[1],
-        tz_mm / spacing[2],
-    )
-    if max(abs(s) for s in shift_vox) > 1e-8:
-        vol = shift(vol, shift=shift_vox, order=1, mode="constant", cval=0.0)
-
-    # Blur
-    vol = gaussian_filter(vol, sigma=blur_sigma)
-
-    # Project
-    proj = vol.sum(axis=proj_axis)
-
-    # Normalize
-    pmin, pmax = proj.min(), proj.max()
-    if pmax - pmin > 1e-8:
-        proj = (proj - pmin) / (pmax - pmin)
-    else:
-        proj = np.zeros_like(proj)
-
-    return proj.astype(np.float32)
-
+    # Min-Max Normalization
+    p_min, p_max = proj.min(), proj.max()
+    return (proj - p_min) / (p_max - p_min + 1e-8)
 
 def ncc_numpy(a, b, eps=1e-8):
     """Normalized Cross-Correlation (numpy)."""
@@ -720,25 +690,14 @@ def ncc_numpy(a, b, eps=1e-8):
     denom = np.sqrt((a*a).sum() * (b*b).sum()) + eps
     return float((a*b).sum() / denom)
 def ncc_torch(a, b, eps=1e-8):
-    """Normalized Cross-Correlation using PyTorch (GPU compatible)."""
-    # Flatten and ensure float
-    if isinstance(a, np.ndarray):
-        a = torch.from_numpy(a).to(device)
-    
-    # Convert 'b' to torch tensor if it's numpy
-    if isinstance(b, np.ndarray):
-        b = torch.from_numpy(b).to(device)
-    a = a.reshape(-1).float()
-    b = b.reshape(-1).float()
+    # Flatten
+    a = a.reshape(-1)
+    b = b.reshape(-1)
     # Zero-mean
-    a = a - a.mean()
-    b = b - b.mean()
-    
+    a = a - torch.mean(a)
+    b = b - torch.mean(b)
     # Correlation
-    numerator = (a * b).sum()
-    denominator = torch.sqrt((a**2).sum() * (b**2).sum()) + eps
-    return (numerator / denominator).item() # .item() returns a plain Python float
-
+    return torch.sum(a * b) / (torch.sqrt(torch.sum(a**2) * torch.sum(b**2)) + eps)
 #Q1: compare MI and masked NCC under degraded images.
 def masked_ncc_numpy(a, b, mask=None, eps=1e-8):
     if mask is None:
@@ -750,171 +709,6 @@ def masked_ncc_numpy(a, b, mask=None, eps=1e-8):
     denom = np.sqrt((av * av).sum() * (bv * bv).sum()) + eps
     return float((av * bv).sum() / denom)
 
-
-# =============================================================================
-# Gradient-Based Optimization with Numerical Gradients
-# =============================================================================
-
-# def compute_numerical_gradient(volume, current_params, observed, spacing, proj_axis,
-#                                 eps_rot=0.1, eps_trans=0.1):
-#     """
-#     Compute gradient using finite differences.
-#     This guarantees we use the exact same rendering as the target.
-#     """
-#     grad = np.zeros(6, dtype=np.float64)
-#     base_ncc = ncc_numpy(render_at_pose(volume, current_params, spacing, proj_axis), observed)
-
-#     for i in range(6):
-#         params_plus = current_params.copy()
-#         eps = eps_rot if i < 3 else eps_trans
-#         params_plus[i] += eps
-
-#         ncc_plus = ncc_numpy(render_at_pose(volume, params_plus, spacing, proj_axis), observed)
-#         grad[i] = (ncc_plus - base_ncc) / eps
-
-#     return grad, base_ncc
-
-
-# def run_diffpose_registration(
-#     moving_volume,
-#     observed_dsa,
-#     init_params=None,
-#     spacing=(1.0, 1.0, 1.0),
-#     proj_axis=0,
-#     n_iters=150,
-#     lr_rot=0.3,
-#     lr_trans=0.5,
-#     momentum=0.9,
-#     verbose=True,
-# ):
-#     """
-#     Gradient-based registration using numerical gradients.
-
-#     Uses the EXACT same rendering as pseudo_dsa_from_volume_at_pose,
-#     with gradient ascent on NCC.
-#     """
-#     if init_params is None:
-#         init_params = np.zeros(6, dtype=np.float32)
-
-#     params = init_params.copy().astype(np.float64)
-#     velocity = np.zeros(6, dtype=np.float64)
-
-#     best_ncc = -float('inf')
-#     best_params = params.copy()
-#     ncc_history = []
-
-#     # Learning rates: [rot, rot, rot, trans, trans, trans]
-#     lrs = np.array([lr_rot, lr_rot, lr_rot, lr_trans, lr_trans, lr_trans], dtype=np.float64)
-
-#     iterator = tqdm(range(n_iters), desc="DiffPose", disable=not verbose)
-
-#     for i in iterator:
-#         # Compute gradient
-#         grad, current_ncc = compute_numerical_gradient(
-#             moving_volume, params, observed_dsa, spacing, proj_axis
-#         )
-
-#         ncc_history.append(current_ncc)
-
-#         # Update best
-#         if current_ncc > best_ncc:
-#             best_ncc = current_ncc
-#             best_params = params.copy()
-
-#         # Momentum update (gradient ascent - maximize NCC)
-#         velocity = momentum * velocity + lrs * grad
-#         params = params + velocity
-
-#         if verbose:
-#             iterator.set_postfix({'NCC': f'{current_ncc:.4f}', 'best': f'{best_ncc:.4f}'})
-
-#         # Early stopping
-#         if best_ncc > 0.99:
-#             if verbose:
-#                 print(f"Converged at iter {i}")
-#             break
-
-#     # Final render
-#     pred_dsa = render_at_pose(moving_volume, best_params, spacing, proj_axis)
-
-#     return {
-#         'pred_params': best_params.astype(np.float32),
-#         'pred_dsa': pred_dsa,
-#         'best_ncc': best_ncc,
-#         'ncc_history': ncc_history,
-#     }
-
-
-# def run_diffpose_multistart(
-#     moving_volume,
-#     observed_dsa,
-#     spacing=(1.0, 1.0, 1.0),
-#     proj_axis=0,
-#     n_restarts=5,
-#     n_iters=100,
-#     verbose=True,
-# ):
-#     """
-#     Multi-start registration to avoid local minima.
-#     """
-#     best_result = None
-#     best_ncc = -float('inf')
-
-#     # Starting points
-#     init_points = [np.zeros(6, dtype=np.float32)]
-
-#     np.random.seed(42)
-#     for _ in range(n_restarts - 1):
-#         rot_init = np.random.uniform(-3, 3, 3).astype(np.float32)
-#         trans_init = np.random.uniform(-3, 3, 3).astype(np.float32)
-#         init_points.append(np.concatenate([rot_init, trans_init]))
-
-#     for idx, init_params in enumerate(init_points):
-#         if verbose:
-#             print(f"\n--- Restart {idx+1}/{n_restarts} ---")
-
-#         result = run_diffpose_registration(
-#             moving_volume=moving_volume,
-#             observed_dsa=observed_dsa,
-#             init_params=init_params,
-#             spacing=spacing,
-#             proj_axis=proj_axis,
-#             n_iters=n_iters,
-#             verbose=verbose,
-#         )
-
-#         if result['best_ncc'] > best_ncc:
-#             best_ncc = result['best_ncc']
-#             best_result = result
-#             if verbose:
-#                 print(f"★ New best NCC: {best_ncc:.4f}")
-
-#     return best_result
-
-
-# def summarize_pose_error(pred_params, gt_params):
-#     """Compute registration error."""
-#     pred = np.asarray(pred_params, dtype=np.float32)
-#     gt = np.asarray(gt_params, dtype=np.float32)
-#     diff = pred - gt
-#     return {
-#         "rot_err_deg_l2": float(np.linalg.norm(diff[:3])),
-#         "trans_err_mm_l2": float(np.linalg.norm(diff[3:])),
-#         "param_diff": diff,
-#     }
-
-
-# print("DiffPose registration with numerical gradients defined.")
-# print("This uses the EXACT same rendering as pseudo_dsa_from_volume_at_pose.")
-
-# %% [markdown]
-# #**<font color='purple'> Refactor the Gradient-Based Optimization code.</font>**
-# 
-# **<font color='purple'> - update `finite_difference_gradient()`: less biased and usually much more stable around local optima.</font>**
-# 
-# **<font color='purple'> - add simple clipping after each update.</font>**
-# 
-# **<font color='purple'> - add gradient decay. (commented out, this seems to reduce perfermance)</font>**
 
 # %%
 from dataclasses import dataclass
@@ -978,7 +772,7 @@ def render_projection(volume, pose, spacing=(1.0, 1.0, 1.0), proj_axis=0):
     """
     if isinstance(pose, PoseParams):
         pose = pose.as_array()
-    return render_at_pose(volume, pose, spacing, proj_axis)
+    return render_at_pose_gpu(volume, pose, proj_axis)
 
 
 def compute_similarity(pred_image, observed_image, metric="ncc"):
@@ -1048,124 +842,71 @@ def clip_params(params,
     out[:3] = np.clip(out[:3], rot_bounds[0], rot_bounds[1])
     out[3:] = np.clip(out[3:], trans_bounds[0], trans_bounds[1])
     return out
-
-
-def optimize_pose_cpu(score_fn, init_params=None, config=None, verbose=True):
-    if config is None:
-        config = OptimizerConfig()
-
-    if init_params is None:
-        init_params = np.zeros(6, dtype=np.float64)
-
-    params = np.asarray(init_params, dtype=np.float64).copy()
-    velocity = np.zeros(6, dtype=np.float64)
-
-    lrs = np.array([
-        config.lr_rot, config.lr_rot, config.lr_rot,
-        config.lr_trans, config.lr_trans, config.lr_trans
-    ], dtype=np.float64)
-
-    best_score = -float("inf")
-    best_params = params.copy()
+def optimize_pose(moving_vol_tensor, observed_img_tensor, init_params, n_iters=100, lr=0.1):
+    """
+    Optimizes pose using PyTorch Autograd and Adam.
+    moving_vol_tensor: (1, 1, D, H, W)
+    observed_img_tensor: (1, 1, H, W)
+    """
+    # 1. Initialize pose on GPU with gradients enabled
+    pose = torch.tensor(init_params, device=device, dtype=torch.float32, requires_grad=True)
+    
+    # 2. Setup Optimizer - Adam is great for handling different units (deg vs mm)
+    optimizer = torch.optim.Adam([pose], lr=lr)
+    
     score_history = []
+    best_score = -1.0
+    best_params = pose.detach().cpu().numpy()
 
-    iterator = tqdm(range(config.n_iters), desc="Register", disable=not verbose)
-
-    for i in iterator:
-        grad, score = finite_difference_gradient(
-            score_fn=score_fn,
-            params=params,
-            eps_rot=config.eps_rot,
-            eps_trans=config.eps_trans
-        )
-
-        # --- gradient clipping / normalization ---
-        grad_norm = np.linalg.norm(grad)
-        if grad_norm > 1.0:
-            grad = grad / grad_norm
-        # -----------------------------------------
-
-        score_history.append(score)
-
-        if score > best_score:
-            best_score = score
-            best_params = params.copy()
-
-        # decay = 0.98 ** i
-        # current_lrs = lrs * decay
-        # velocity = config.momentum * velocity + current_lrs * grad
-        velocity = config.momentum * velocity + lrs * grad
-        params = params + velocity
-        params = clip_params(params) #new
-
-        if verbose:
-            iterator.set_postfix({
-                "score": f"{score:.4f}",
-                "best": f"{best_score:.4f}"
-            })
-
-        if best_score > 0.99:
-            if verbose:
-                print(f"Converged at iter {i}")
-            break
-
-    return best_params, best_score, score_history
-def optimize_pose(moving_vol, observed_img, init_params):
-    # Parameters we want to optimize
-    pose = torch.tensor(init_params, device=device, requires_grad=True)
-    
-    # Optimizer (Adam handles different scales of rotation vs translation well)
-    optimizer = torch.optim.Adam([pose], lr=0.1)
-    
-    for i in range(100):
+    for i in range(n_iters):
         optimizer.zero_grad()
         
-        # GPU Rendering
-        pred_img = render_at_pose_gpu(moving_vol, pose, spacing)
+        # 3. GPU Rendering
+        # Ensure moving_vol_tensor is on the correct device
+        pred_img = render_at_pose_gpu(moving_vol_tensor, pose, proj_axis=0)
         
-        # Loss (1 - NCC because we want to minimize)
-        loss = 1 - ncc_torch(pred_img, observed_img)
+        # 4. Loss calculation (Minimize 1 - NCC)
+        # We use a 2D NCC. Ensure tensors are (H, W) or (1, 1, H, W)
+        current_ncc = ncc_torch(pred_img, observed_img_tensor)
+        loss = 1.0 - current_ncc
         
-        # Backprop (Calculating gradients automatically)
+        # 5. Backprop
         loss.backward()
-        
-        # Update pose
         optimizer.step()
         
-        if i % 10 == 0:
-            print(f"Iteration {i}, NCC: {1 - loss.item():.4f}")
-            
-    return pose.detach().cpu().numpy()
+        # 6. Constrain params (Optional but recommended)
+        with torch.no_grad():
+            pose[:3].clamp_(-15, 15)  # Max 15 degrees
+            pose[3:].clamp_(-20, 20)  # Max 20 mm
 
-def register_single_start(
-    problem: RegistrationProblem,
-    init_pose=None,
-    metric="ncc",
-    optimizer_config=None,
-    verbose=True,
-):
-    if optimizer_config is None:
-        optimizer_config = OptimizerConfig()
+        # Record keeping
+        score_history.append(current_ncc)
+        if current_ncc > best_score:
+            best_score = current_ncc
+            best_params = pose.detach().cpu().numpy().copy()
 
-    score_fn = make_score_function(problem, metric=metric)
-    init_arr = None if init_pose is None else (
+    return best_params, best_score, score_history
+def register_single_start(problem: RegistrationProblem, init_pose=None, verbose=True):
+    # Convert inputs to Tensors
+    moving_tensor = torch.from_numpy(problem.moving_volume).float().to(device).unsqueeze(0).unsqueeze(0)
+    obs_tensor = torch.from_numpy(problem.observed_image).float().to(device)
+
+    init_arr = np.zeros(6, dtype=np.float32) if init_pose is None else (
         init_pose.as_array() if isinstance(init_pose, PoseParams) else np.asarray(init_pose, dtype=np.float32)
     )
 
+    # Use the GPU optimizer
     best_params, best_score, history = optimize_pose(
-        score_fn=score_fn,
-        init_params=init_arr,
-        config=optimizer_config,
-        verbose=verbose,
+        moving_tensor, 
+        obs_tensor, 
+        init_arr, 
+        n_iters=150, 
+        lr=0.1
     )
 
     pred_pose = PoseParams.from_array(best_params)
-    pred_image = render_projection(
-        volume=problem.moving_volume,
-        pose=pred_pose,
-        spacing=problem.spacing,
-        proj_axis=problem.proj_axis,
-    )
+    # Render final result for visualization
+    pred_image = render_at_pose_gpu(moving_tensor, torch.tensor(best_params, device=device)).detach().cpu().numpy()
 
     return RegistrationResult(
         pred_pose=pred_pose,
@@ -1173,8 +914,6 @@ def register_single_start(
         best_score=best_score,
         score_history=history,
     )
-
-
 def sample_init_poses(n_restarts=5, seed=42):
     rng = np.random.default_rng(seed)
     poses = [PoseParams()]
@@ -1270,59 +1009,37 @@ def multiscale_register(problem, metric="ncc", verbose=True):
         {"downsample": 0.50, "blur_sigma": 1.0, "n_iters": 30},
         {"downsample": 1.00, "blur_sigma": 0.5, "n_iters": 36},
     ]
+
+    # Initial guess
+    current_params = np.zeros(6, dtype=np.float32)
     
-    current_pose = PoseParams()
+    # Pre-convert moving volume to tensor once
+    moving_tensor_full = torch.from_numpy(problem.moving_volume).float().to(device).unsqueeze(0).unsqueeze(0)
 
-    for stage_id, stage in enumerate(scales, start=1):
-        moving_ds = maybe_downsample_volume(problem.moving_volume, stage["downsample"])
-        obs_tensor = problem.observed_image[None, None, ...] 
+    for stage in scales:
+        # Downsample observed image
+        obs_tensor = torch.from_numpy(problem.observed_image).float().to(device).unsqueeze(0).unsqueeze(0)
+        if stage["downsample"] < 1.0:
+            obs_ready = F.interpolate(obs_tensor, scale_factor=stage["downsample"], mode='bilinear')
+            # For the volume, downsampling a 3D tensor on GPU:
+            mov_ready = F.interpolate(moving_tensor_full, scale_factor=stage["downsample"], mode='trilinear')
+        else:
+            obs_ready = obs_tensor
+            mov_ready = moving_tensor_full
 
-        observed_ds = F.interpolate(
-             obs_tensor, 
-            scale_factor=stage["downsample"], 
-             mode='bilinear', 
-            align_corners=False
-        ).squeeze() # Remove the extra dimensions back to [H, W]
-        '''
-        temp_np = problem.observed_image.detach().cpu().numpy()
-
-        # Prform the zoom
-        observed_ds_np = zoom(temp_np, zoom=stage["downsample"], order=1).astype(np.float32)
-
-        # Move back to GPU
-        observed_ds = torch.from_numpy(observed_ds_np).to(device)
-        '''
-        spacing_ds = tuple(s / stage["downsample"] for s in problem.spacing)
-
-        stage_problem = RegistrationProblem(
-            moving_volume=moving_ds,
-            observed_image=observed_ds,
-            spacing=spacing_ds,
-            proj_axis=problem.proj_axis,
+        # Run the GPU optimizer
+        current_params, score, history = optimize_pose(
+            mov_ready, 
+            obs_ready.squeeze(), 
+            current_params, 
+            n_iters=stage["n_iters"],
+            lr=stage["lr"]
         )
+        
+        if verbose:
+            print(f"Scale {stage['downsample']} finished. Best NCC: {score:.4f}")
 
-        result = register_single_start(
-            problem=stage_problem,
-            init_pose=current_pose,
-            metric=metric,
-            optimizer_config=OptimizerConfig(n_iters=stage["n_iters"]),
-            verbose=verbose,
-        )
-        current_pose = result.pred_pose
-
-    final_pred = render_projection(
-        volume=problem.moving_volume,
-        pose=current_pose,
-        spacing=problem.spacing,
-        proj_axis=problem.proj_axis,
-    )
-
-    return RegistrationResult(
-        pred_pose=current_pose,
-        pred_image=final_pred,
-        best_score=compute_similarity(final_pred, problem.observed_image, metric=metric),
-        score_history=[],
-    )
+    return PoseParams.from_array(current_params)
 
 # %% [markdown]
 # **<font color='purple'> Evaluation metrics (mTRE, SMSR)</font>**
@@ -1728,7 +1445,7 @@ for index in range(27):
     print(f"Ground truth params: {T_gt}")
 
     # First verify rendering matches
-    test_render = render_at_pose(healthy_binary_ds, T_gt, spacing_ds, PROJ_AXIS)
+    test_render = render_at_pose_gpu(healthy_binary_ds, T_gt, PROJ_AXIS)
     match_ncc = ncc_torch(test_render, baseline_dsa_obs)
     print(f"Verification - NCC between GT render and observed: {match_ncc:.6f}")
     print("(Should be ~1.0 if rendering matches)")
