@@ -646,185 +646,55 @@ print(f"Using device: {device}")
 # =============================================================================
 # This ensures the optimization target matches the observed image exactly.
 
-def _make_gaussian_kernel_3d(sigma: float, device: torch.device) -> torch.Tensor:
-    """Build a 3-D Gaussian kernel as a (1,1,K,K,K) conv weight tensor."""
-    radius = int(math.ceil(3.0 * sigma))
-    size = 2 * radius + 1
-    coords = torch.arange(size, dtype=torch.float32, device=device) - radius
-    g1d = torch.exp(-0.5 * (coords / sigma) ** 2)
-    g1d = g1d / g1d.sum()
-    kernel = g1d[:, None, None] * g1d[None, :, None] * g1d[None, None, :]
-    return kernel.view(1, 1, size, size, size)
-
-
-def _rot_theta(angle_deg: float, axes: tuple, shape: tuple,
-               device: torch.device) -> torch.Tensor:
-    """
-    Return the (1,3,4) affine theta for affine_grid that exactly replicates
-    one call of scipy.ndimage.rotate(vol, angle_deg, axes=axes, reshape=False).
-
-    Derivation
-    ----------
-    scipy forward rotation in plane (a0, a1):
-        new_a0 =  cos*old_a0 - sin*old_a1
-        new_a1 =  sin*old_a0 + cos*old_a1
-    Inverse warp (output -> input coords, what grid_sample needs):
-        in_a0  =  cos*out_a0 + sin*out_a1
-        in_a1  = -sin*out_a0 + cos*out_a1
-
-    affine_grid with a 5-D (N,C,X,Y,Z) tensor (D=X, H=Y, W=Z):
-        theta rows    : source dims in order (Z_src, Y_src, X_src)  <-- reversed!
-        theta col vec : target coords in order (Z_tgt, Y_tgt, X_tgt, 1)  <-- reversed!
-    Both row and column use the mapping k -> (2-k): X<->2, Y<->1, Z<->0.
-    """
-    a = math.radians(angle_deg)
-    c, s = math.cos(a), math.sin(a)
-    a0, a1 = axes  # spatial axes in (X,Y,Z) = (0,1,2) index space
-
-    # row/col index in theta for spatial dim k: X->2, Y->1, Z->0
-    def rc(k): return 2 - k
-
-    # Identity: source dim k samples from target dim k
-    theta = torch.zeros(3, 4, dtype=torch.float32, device=device)
-    for k in range(3):
-        theta[rc(k), rc(k)] = 1.0
-
-    # Overwrite the 2x2 block for the rotation plane
-    # src_a0 = cos*tgt_a0 + sin*tgt_a1
-    theta[rc(a0), rc(a0)] =  c
-    theta[rc(a0), rc(a1)] =  s
-    # src_a1 = -sin*tgt_a0 + cos*tgt_a1
-    theta[rc(a1), rc(a0)] = -s
-    theta[rc(a1), rc(a1)] =  c
-
-    return theta.unsqueeze(0)  # (1, 3, 4)
-
-
-def _trans_theta(dx: float, dy: float, dz: float,
-                 shape: tuple, device: torch.device) -> torch.Tensor:
-    """
-    Return the (1,3,4) affine theta that replicates
-    scipy.ndimage.shift(vol, shift=(dx, dy, dz)).
-
-    scipy shift moves content forward: input at (x,y,z) appears at output (x+dx,y+dy,z+dz).
-    Inverse warp: output[x,y,z] samples input[x-dx, y-dy, z-dz].
-
-    theta rows=(Z_src,Y_src,X_src), cols=(Z_tgt,Y_tgt,X_tgt,1):
-        Row0 (Z_src): Z_src = Z_tgt - 2*dz/(Z-1) -> [1, 0, 0, -2*dz/(Z-1)]
-        Row1 (Y_src): Y_src = Y_tgt - 2*dy/(Y-1) -> [0, 1, 0, -2*dy/(Y-1)]
-        Row2 (X_src): X_src = X_tgt - 2*dx/(X-1) -> [0, 0, 1, -2*dx/(X-1)]
-    """
-    X, Y, Z = shape
-    theta = torch.zeros(3, 4, dtype=torch.float32, device=device)
-    theta[0, 0] = 1.0;  theta[0, 3] = -2.0 * dz / max(Z - 1, 1)
-    theta[1, 1] = 1.0;  theta[1, 3] = -2.0 * dy / max(Y - 1, 1)
-    theta[2, 2] = 1.0;  theta[2, 3] = -2.0 * dx / max(X - 1, 1)
-    return theta.unsqueeze(0)  # (1, 3, 4)
-
-
-def _compose_theta(t1: torch.Tensor, t2: torch.Tensor) -> torch.Tensor:
-    """
-    Compose two (1,3,4) inverse-warp affines so that t1 is applied first,
-    then t2.  In inverse-warp: M_composed = M_t2 @ M_t1 (t2 wraps t1).
-    """
-    def to_44(t):
-        bot = torch.tensor([[0., 0., 0., 1.]], dtype=t.dtype, device=t.device)
-        return torch.cat([t.squeeze(0), bot], dim=0)
-    M = to_44(t2) @ to_44(t1)
-    return M[:3].unsqueeze(0)  # (1, 3, 4)
-
-
 def render_at_pose(volume, pose_params, spacing, proj_axis=0, blur_sigma=1.0):
     """
-    Render pseudo-DSA at given pose on GPU using PyTorch.
-
-    Exactly replicates pseudo_dsa_from_volume_at_pose / apply_rigid_transform_volume:
-      Rx(axes=1,2) -> Ry(axes=0,2) -> Rz(axes=0,1) -> shift(tx,ty,tz) ->
-      Gaussian blur -> sum-project -> normalize [0,1].
-
-    All rotations are around the volume centre and use scipy's convention.
-    Everything runs on `device`; result is returned as a CPU numpy float32 array.
+    Render pseudo-DSA at given pose - IDENTICAL to pseudo_dsa_from_volume_at_pose.
     """
-    rx_deg, ry_deg, rz_deg, tx_mm, ty_mm, tz_mm = [float(p) for p in pose_params]
+    rx_deg, ry_deg, rz_deg, tx_mm, ty_mm, tz_mm = pose_params
 
-    # Upload to GPU: (1,1,X,Y,Z)
-    vol_t = torch.tensor(volume, dtype=torch.float32, device=device)
-    shape = tuple(vol_t.shape)   # (X, Y, Z)
-    vol_5d = vol_t.unsqueeze(0).unsqueeze(0)
+    vol = volume.astype(np.float32).copy()
 
-    # Build the list of elementary affines in application order
-    # (each is a (1,3,4) inverse-warp theta)
-    thetas = []
+    # Rotations (same axes convention as scipy.ndimage.rotate)
     if abs(rx_deg) > 1e-8:
-        thetas.append(_rot_theta(rx_deg, axes=(1, 2), shape=shape, device=device))
+        vol = rotate(vol, angle=rx_deg, axes=(1, 2), reshape=False, order=1, mode="constant", cval=0.0)
     if abs(ry_deg) > 1e-8:
-        thetas.append(_rot_theta(ry_deg, axes=(0, 2), shape=shape, device=device))
+        vol = rotate(vol, angle=ry_deg, axes=(0, 2), reshape=False, order=1, mode="constant", cval=0.0)
     if abs(rz_deg) > 1e-8:
-        thetas.append(_rot_theta(rz_deg, axes=(0, 1), shape=shape, device=device))
+        vol = rotate(vol, angle=rz_deg, axes=(0, 1), reshape=False, order=1, mode="constant", cval=0.0)
 
-    dx = tx_mm / spacing[0]
-    dy = ty_mm / spacing[1]
-    dz = tz_mm / spacing[2]
-    if max(abs(dx), abs(dy), abs(dz)) > 1e-8:
-        thetas.append(_trans_theta(dx, dy, dz, shape=shape, device=device))
+    # Translation (mm to voxels)
+    shift_vox = (
+        tx_mm / spacing[0],
+        ty_mm / spacing[1],
+        tz_mm / spacing[2],
+    )
+    if max(abs(s) for s in shift_vox) > 1e-8:
+        vol = shift(vol, shift=shift_vox, order=1, mode="constant", cval=0.0)
 
-    if thetas:
-        # scipy applies [rx, ry, rz, trans] in order.
-        # Inverse warp must undo in REVERSE: trans, rz, ry, rx.
-        # _compose_theta(t1,t2) = M_t2 @ M_t1 (t1 applied first to output coords).
-        # Iterating reversed list gives M_rx @ M_ry @ M_rz @ M_trans — correct chain.
-        rev = list(reversed(thetas))
-        composed = rev[0]
-        for t in rev[1:]:
-            composed = _compose_theta(composed, t)
+    # Blur
+    vol = gaussian_filter(vol, sigma=blur_sigma)
 
-        grid = torch.nn.functional.affine_grid(
-            composed, vol_5d.shape, align_corners=True
-        )
-        vol_5d = torch.nn.functional.grid_sample(
-            vol_5d, grid,
-            mode='bilinear', padding_mode='zeros', align_corners=True
-        )
+    # Project
+    proj = vol.sum(axis=proj_axis)
 
-    # Gaussian blur
-    if blur_sigma > 1e-8:
-        kernel = _make_gaussian_kernel_3d(blur_sigma, device)
-        pad = kernel.shape[-1] // 2
-        vol_5d = torch.nn.functional.conv3d(vol_5d, kernel, padding=pad)
-
-    vol_warped = vol_5d.squeeze(0).squeeze(0)   # (X, Y, Z)
-
-    # Sum-project and normalize
-    proj = vol_warped.sum(dim=proj_axis)
+    # Normalize
     pmin, pmax = proj.min(), proj.max()
-    if (pmax - pmin) > 1e-8:
+    if pmax - pmin > 1e-8:
         proj = (proj - pmin) / (pmax - pmin)
     else:
-        proj = torch.zeros_like(proj)
+        proj = np.zeros_like(proj)
 
-    return proj.detach().cpu().numpy().astype(np.float32)
+    return proj.astype(np.float32)
 
 
 def ncc_numpy(a, b, eps=1e-8):
-    """
-    Normalized Cross-Correlation computed on GPU via PyTorch, returned as float.
-
-    Inputs may be np.ndarray or torch.Tensor of any shape.
-    """
-    if isinstance(a, np.ndarray):
-        a = torch.tensor(a, dtype=torch.float64, device=device)
-    else:
-        a = a.to(dtype=torch.float64, device=device)
-
-    if isinstance(b, np.ndarray):
-        b = torch.tensor(b, dtype=torch.float64, device=device)
-    else:
-        b = b.to(dtype=torch.float64, device=device)
-
-    a = a.flatten() - a.mean()
-    b = b.flatten() - b.mean()
-    denom = torch.sqrt((a * a).sum() * (b * b).sum()) + eps
-    return float((a * b).sum() / denom)
+    """Normalized Cross-Correlation (numpy)."""
+    a = a.astype(np.float64).flatten()
+    b = b.astype(np.float64).flatten()
+    a = a - a.mean()
+    b = b - b.mean()
+    denom = np.sqrt((a*a).sum() * (b*b).sum()) + eps
+    return float((a*b).sum() / denom)
 
 #Q1: compare MI and masked NCC under degraded images.
 def masked_ncc_numpy(a, b, mask=None, eps=1e-8):
@@ -1567,7 +1437,7 @@ def run_benchmark_cases(case_dict, moving_model=None, init_params=None,
 # =============================================================================
 
 
-path = "TopBrain_Data_Release_Batches1n2_081425"
+path = "/Users/yanran/Documents/school/CSE291G/Project/TopBrain_Data_Release_Batches1n2_081425"
 #/content/drive/MyDrive/CSE291G
 label_path = Path(path+'/labelsTr_topbrain_ct/')
 input_path = Path(path+'/imagesTr_topbrain_ct/')
