@@ -645,8 +645,32 @@ print(f"Using device: {device}")
 # Use the EXACT SAME rendering as your original pseudo_dsa_from_volume_at_pose
 # =============================================================================
 # This ensures the optimization target matches the observed image exactly.
-
-def render_at_pose(volume, pose_params, spacing, proj_axis=0, blur_sigma=1.0):
+def render_at_pose(volume_tensor, pose_params, spacing, proj_axis=0):
+    """
+    volume_tensor: (1, 1, D, H, W) torch tensor already on GPU
+    pose_params: (6,) tensor [rx, ry, rz, tx, ty, tz]
+    """
+    device = volume_tensor.device
+    B, C, D, H, W = volume_tensor.shape
+    
+    # 1. Convert pose_params to an Affine Matrix (3x4)
+    # Note: For brevity, use a helper to build the rotation matrix R and translation t
+    # For a deep-dive, see torch.affine_grid documentation
+    affine_matrix = build_affine_matrix(pose_params, device) 
+    
+    # 2. Generate the grid
+    grid = F.affine_grid(affine_matrix, [B, C, D, H, W], align_corners=False)
+    
+    # 3. Sample the volume (This is the GPU magic)
+    moved_vol = F.grid_sample(volume_tensor, grid, mode='bilinear', align_corners=False)
+    
+    # 4. Project (Sum along axis)
+    proj = moved_vol.sum(dim=proj_axis+2) # +2 because of (B, C) dims
+    
+    # 5. Normalize 0-1
+    proj = (proj - proj.min()) / (proj.max() - proj.min() + 1e-8)
+    return proj
+def render_at_pose_cpu(volume, pose_params, spacing, proj_axis=0, blur_sigma=1.0):
     """
     Render pseudo-DSA at given pose - IDENTICAL to pseudo_dsa_from_volume_at_pose.
     """
@@ -1026,7 +1050,7 @@ def clip_params(params,
     return out
 
 
-def optimize_pose(score_fn, init_params=None, config=None, verbose=True):
+def optimize_pose_cpu(score_fn, init_params=None, config=None, verbose=True):
     if config is None:
         config = OptimizerConfig()
 
@@ -1086,7 +1110,32 @@ def optimize_pose(score_fn, init_params=None, config=None, verbose=True):
             break
 
     return best_params, best_score, score_history
-
+def optimize_pose(moving_vol, observed_img, init_params):
+    # Parameters we want to optimize
+    pose = torch.tensor(init_params, device=device, requires_grad=True)
+    
+    # Optimizer (Adam handles different scales of rotation vs translation well)
+    optimizer = torch.optim.Adam([pose], lr=0.1)
+    
+    for i in range(100):
+        optimizer.zero_grad()
+        
+        # GPU Rendering
+        pred_img = render_at_pose_gpu(moving_vol, pose, spacing)
+        
+        # Loss (1 - NCC because we want to minimize)
+        loss = 1 - ncc_torch(pred_img, observed_img)
+        
+        # Backprop (Calculating gradients automatically)
+        loss.backward()
+        
+        # Update pose
+        optimizer.step()
+        
+        if i % 10 == 0:
+            print(f"Iteration {i}, NCC: {1 - loss.item():.4f}")
+            
+    return pose.detach().cpu().numpy()
 
 def register_single_start(
     problem: RegistrationProblem,
