@@ -1,54 +1,3 @@
-# %% [markdown]
-# 
-# # To start
-# 1. download the dataset: https://topbrain2025.grand-challenge.org/data/
-# 2. store the dataset in your google drive folder  `CSE291G`, inside the folder you should have two folders
-# `labelsTr_topbrain_ct/topcow_ct_001_0000.nii.gz"`
-# and
-# `imagesTr_topbrain_ct/topcow_ct_001.nii.gz"`
-# 3. then select GPU in google colab under `notebook setting`
-# 
-
-# %% [markdown]
-# 
-# 
-# #<font color="red"> **The following code is applied to 1 single patient CTA. But we can reuse this code later as python file to process all 29 patient in registration pipeline**</font>
-# 
-# 
-# DiffDRR: https://github.com/eigenvivek/DiffDRR
-# paper: https://arxiv.org/pdf/2208.12737
-# 
-# 
-# DiffPose:  https://github.com/eigenvivek/DiffPose
-# 
-# 
-# It does these steps:
-# 
-# 1. Load the **CTA image** and **multiclass vessel label map**
-# 2. Understand label IDs present in the case
-# 3. <font color="red"> Keep only the **healthy hemisphere** THIS PART IS UNSURE PLEASE CHECK THE CODE</font>
-# 4. Build controlled perturbations:
-#    - **Q1**: image noise after 2D projection
-#    - **Q2**: random vessel-volume loss
-#    - **Q3**: removal of proximal / medium / distal vessel groups
-# 5. Generate a **projection-based pseudo-DSA** for debugging the pipeline
-# 6. Save outputs for later registration experiments
-# 
-# ## Files used
-# 
-# - `topcow_ct_001_0000.nii.gz` → CTA image volume
-# - `topcow_ct_001.nii.gz` → vessel label map
-# 
-
-# %%
-
-# Uncomment once if needed
-# %pip install nibabel matplotlib scipy pandas
-
-
-
-
-# %%
 
 from pathlib import Path
 import json
@@ -436,22 +385,36 @@ print(f"Using device: {device}")
 # =============================================================================
 # This ensures the optimization target matches the observed image exactly.
 def build_affine_matrix(pose_params, device):
-    """
-    Converts [rx, ry, rz, tx, ty, tz] into a 3x4 Affine Matrix for torch.
-    Note: Standard grid_sample uses normalized coordinates [-1, 1].
-    """
+
     rx, ry, rz = torch.deg2rad(pose_params[0]), torch.deg2rad(pose_params[1]), torch.deg2rad(pose_params[2])
     tx, ty, tz = pose_params[3], pose_params[4], pose_params[5]
 
-    # Rotation matrices
-    Rx = torch.tensor([[1, 0, 0], [0, torch.cos(rx), -torch.sin(rx)], [0, torch.sin(rx), torch.cos(rx)]], device=device)
-    Ry = torch.tensor([[torch.cos(ry), 0, torch.sin(ry)], [0, 1, 0], [-torch.sin(ry), 0, torch.cos(ry)]], device=device)
-    Rz = torch.tensor([[torch.cos(rz), -torch.sin(rz), 0], [torch.sin(rz), torch.cos(rz), 0], [0, 0, 1]], device=device)
-    
+    one = torch.ones((), device=device)
+    zero = torch.zeros((), device=device)
+
+    Rx = torch.stack([
+        torch.stack([one, zero, zero]),
+        torch.stack([zero, torch.cos(rx), -torch.sin(rx)]),
+        torch.stack([zero, torch.sin(rx), torch.cos(rx)])
+    ])
+
+    Ry = torch.stack([
+        torch.stack([torch.cos(ry), zero, torch.sin(ry)]),
+        torch.stack([zero, one, zero]),
+        torch.stack([-torch.sin(ry), zero, torch.cos(ry)])
+    ])
+
+    Rz = torch.stack([
+        torch.stack([torch.cos(rz), -torch.sin(rz), zero]),
+        torch.stack([torch.sin(rz), torch.cos(rz), zero]),
+        torch.stack([zero, zero, one])
+    ])
+
     R = Rz @ Ry @ Rx
-    t = torch.tensor([[tx], [ty], [tz]], device=device)
-    
-    return torch.cat([R, t], dim=1).unsqueeze(0) # Shape (1, 3, 4)
+
+    t = torch.stack([tx, ty, tz]).unsqueeze(1)
+
+    return torch.cat([R, t], dim=1).unsqueeze(0)
 
 def render_at_pose_gpu(volume_tensor, pose_params, proj_axis=0):
     """
@@ -642,7 +605,7 @@ def optimize_pose(moving_vol_tensor, observed_img_tensor, init_params, n_iters=1
     """
     # 1. Initialize pose on GPU with gradients enabled
     pose = torch.tensor(init_params, device=device, dtype=torch.float32, requires_grad=True)
-    observed_img_tensor  = torch.tensor(observed_img_tensor, device=device, dtype=torch.float32)
+    # observed_img_tensor  = torch.tensor(observed_img_tensor, device=device, dtype=torch.float32)
 
     # 2. Setup Optimizer - Adam is great for handling different units (deg vs mm)
     optimizer = torch.optim.Adam([pose], lr=lr)
@@ -657,10 +620,10 @@ def optimize_pose(moving_vol_tensor, observed_img_tensor, init_params, n_iters=1
         # 3. GPU Rendering
         # Ensure moving_vol_tensor is on the correct device
         pred_img = render_at_pose_gpu(moving_vol_tensor, pose, proj_axis=0)
-        
         # 4. Loss calculation (Minimize 1 - NCC)
         # We use a 2D NCC. Ensure tensors are (H, W) or (1, 1, H, W)
         current_ncc = ncc_torch(pred_img, observed_img_tensor)
+        
         loss = 1.0 - current_ncc
         
         # 5. Backprop
@@ -699,7 +662,7 @@ def register_single_start(problem: RegistrationProblem, init_pose=None, verbose=
 
     pred_pose = PoseParams.from_array(best_params)
     # Render final result for visualization
-    pred_image = render_at_pose_gpu(moving_tensor, torch.tensor(best_params, device=device)).detach().cpu().numpy()
+    pred_image = render_at_pose_gpu(moving_tensor, torch.tensor(best_params, device=device))
 
     return RegistrationResult(
         pred_pose=pred_pose,
@@ -832,7 +795,28 @@ def multiscale_register(problem, metric="ncc", verbose=True):
         if verbose:
             print(f"Scale {stage['downsample']} finished. Best NCC: {score:.4f}")
 
-    return PoseParams.from_array(current_params)
+    final_pose = PoseParams.from_array(current_params)
+
+    # Render final DRR
+    final_pred = render_at_pose_gpu(
+        moving_tensor_full,
+        torch.tensor(current_params, device=device)
+    )
+
+    # Compute similarity
+    print(type(final_pred),type(problem))
+    best_score = compute_similarity(
+        final_pred,
+        problem.observed_image.to(final_pred.device),
+        metric=metric
+    )
+
+    return RegistrationResult(
+        pred_pose=final_pose,
+        pred_image=final_pred,
+        best_score=best_score,
+        score_history=[],
+    )
 
 # %% [markdown]
 # **<font color='purple'> Evaluation metrics (mTRE, SMSR)</font>**
