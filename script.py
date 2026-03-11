@@ -1,3 +1,54 @@
+# %% [markdown]
+# 
+# # To start
+# 1. download the dataset: https://topbrain2025.grand-challenge.org/data/
+# 2. store the dataset in your google drive folder  `CSE291G`, inside the folder you should have two folders
+# `labelsTr_topbrain_ct/topcow_ct_001_0000.nii.gz"`
+# and
+# `imagesTr_topbrain_ct/topcow_ct_001.nii.gz"`
+# 3. then select GPU in google colab under `notebook setting`
+# 
+
+# %% [markdown]
+# 
+# 
+# #<font color="red"> **The following code is applied to 1 single patient CTA. But we can reuse this code later as python file to process all 29 patient in registration pipeline**</font>
+# 
+# 
+# DiffDRR: https://github.com/eigenvivek/DiffDRR
+# paper: https://arxiv.org/pdf/2208.12737
+# 
+# 
+# DiffPose:  https://github.com/eigenvivek/DiffPose
+# 
+# 
+# It does these steps:
+# 
+# 1. Load the **CTA image** and **multiclass vessel label map**
+# 2. Understand label IDs present in the case
+# 3. <font color="red"> Keep only the **healthy hemisphere** THIS PART IS UNSURE PLEASE CHECK THE CODE</font>
+# 4. Build controlled perturbations:
+#    - **Q1**: image noise after 2D projection
+#    - **Q2**: random vessel-volume loss
+#    - **Q3**: removal of proximal / medium / distal vessel groups
+# 5. Generate a **projection-based pseudo-DSA** for debugging the pipeline
+# 6. Save outputs for later registration experiments
+# 
+# ## Files used
+# 
+# - `topcow_ct_001_0000.nii.gz` → CTA image volume
+# - `topcow_ct_001.nii.gz` → vessel label map
+# 
+
+# %%
+
+# Uncomment once if needed
+# %pip install nibabel matplotlib scipy pandas
+
+
+
+
+# %%
 
 from pathlib import Path
 import json
@@ -8,13 +59,20 @@ import nibabel as nib
 import matplotlib.pyplot as plt
 import gzip
 import shutil
-
+import torch.nn.functional as F
 from scipy.ndimage import gaussian_filter, rotate, shift, zoom
 from scipy.optimize import minimize
 
 
+
+
+
 import nibabel as nib
 import numpy as np
+
+
+
+
 
 
 
@@ -81,6 +139,7 @@ TOPBRAIN_CTA_LABELS = {
     39: 'L-BVR',
     40: 'SSS'
 }
+
 
 
 # %%
@@ -158,6 +217,12 @@ def keep_single_hemisphere(volume, affine, keep_side='right'):
 
 
 
+# %% [markdown]
+# ## Helper functions
+# 
+# - save_nifti: This function saves a 3D volume as a .nii or .nii.gz medical image file.
+# 
+# 
 
 # %%
 
@@ -188,6 +253,7 @@ def normalize_01(x):
 
 
 
+
 def remove_random_vessel_volume(binary_mask, removal_fraction, seed=0):
     """
     Randomly zero out a percentage of vessel voxels.
@@ -210,6 +276,32 @@ def remove_random_vessel_volume(binary_mask, removal_fraction, seed=0):
 VOLUME_LOSS_LEVELS = [0.10, 0.50, 0.80]
 
 
+# plt.show()
+
+
+# %% [markdown]
+# 
+# ## Q3 — vessel-group removal
+# 
+# defines three groups:
+# 
+# - **proximal / large**: ICA, BA, VA
+# - **medium**: M1, A1/A2, P1/P2
+# - **distal**: M2/M3, A3, P3/P4, 3rd-A3
+# 
+# Below, the groups are written in terms of TopBrain CTA label IDs.
+# The code automatically ignores IDs that are not present in this specific case.
+# 
+
+# %%
+
+# VESSEL_GROUPS = {
+#     'proximal': [1, 4, 6, 22, 23],      # BA, R/L ICA, R/L VA
+#     'medium':   [2, 3, 5, 7, 11, 12],   # P1P2, M1, A1A2
+#     'distal':   [13, 14, 15, 16, 17, 18, 20, 21],  # 3rd-A2, A3, M2M3/M4, P3P4
+# }
+
+#3rd-A2, 3rd-A3
 
 VESSEL_GROUPS = {
     'proximal': [1, 4, 6, 23, 24],      # BA, R/L ICA, R/L VA
@@ -244,6 +336,7 @@ def add_poisson_noise(image, peak=40, seed=0):
     scaled = np.clip(image, 0.0, 1.0) * peak
     noisy = rng.poisson(scaled) / float(peak)
     return np.clip(noisy, 0.0, 1.0)
+
 
 
 def sample_random_rigid_params(seed=0,
@@ -296,6 +389,17 @@ def apply_rigid_transform_volume(volume, rx_deg=0.0, ry_deg=0.0, rz_deg=0.0,
     return vol
 
 
+
+# %% [markdown]
+# 
+# ## Render DSA
+# 
+# For now we use a **simple projection placeholder** so the perturbation pipeline is correct and easy to debug. don't use diffdrr
+# 
+# 
+# # **<font color='red'> DiffDRR did not work well in our setting because it simulates realistic X-ray physics and expects a full CT attenuation volume containing tissue, bone, and contrast values. Our data, consists only of binary vessel masks where voxels are either vessel or background. Since vessels occupy only a small number of voxels along each X-ray path, the accumulated attenuation is extremely small, which results in very low image contrast and nearly blank projections. </font>**
+# 
+# 
 # 
 
 # %%
@@ -311,6 +415,7 @@ def pseudo_dsa_from_volume_at_pose(binary_or_soft_volume, pose_params,
     moved = gaussian_filter(moved.astype(np.float32), sigma=blur_sigma)
     proj = moved.sum(axis=proj_axis)
     return normalize_01(proj)
+
 
 print("TPU setup cell - uncomment lines above if using TPU runtime")
 print("For GPU: Just make sure you selected GPU in Runtime settings")
@@ -330,56 +435,140 @@ print(f"Using device: {device}")
 # Use the EXACT SAME rendering as your original pseudo_dsa_from_volume_at_pose
 # =============================================================================
 # This ensures the optimization target matches the observed image exactly.
-
-def render_at_pose(volume, pose_params, spacing, proj_axis=0, blur_sigma=1.0):
+def build_affine_matrix(pose_params, vol_shape, device):
     """
-    Render pseudo-DSA at given pose - IDENTICAL to pseudo_dsa_from_volume_at_pose.
+    Constructs a 3x4 affine matrix for PyTorch grid_sample.
+    pose_params: [rx, ry, rz, tx, ty, tz]
+    vol_shape: (D, H, W)
     """
-    rx_deg, ry_deg, rz_deg, tx_mm, ty_mm, tz_mm = pose_params
+    # 1. Convert angles to radians
+    ax = torch.deg2rad(pose_params[0])
+    ay = torch.deg2rad(pose_params[1])
+    az = torch.deg2rad(pose_params[2])
 
-    vol = volume.astype(np.float32).copy()
+    # 2. Create 3x3 Rotation Matrices
+    # Rotation around X
+    Rx = torch.tensor([
+        [1, 0, 0],
+        [0, torch.cos(ax), -torch.sin(ax)],
+        [0, torch.sin(ax), torch.cos(ax)]
+    ], device=device, dtype=torch.float32)
 
-    # Rotations (same axes convention as scipy.ndimage.rotate)
-    if abs(rx_deg) > 1e-8:
-        vol = rotate(vol, angle=rx_deg, axes=(1, 2), reshape=False, order=1, mode="constant", cval=0.0)
-    if abs(ry_deg) > 1e-8:
-        vol = rotate(vol, angle=ry_deg, axes=(0, 2), reshape=False, order=1, mode="constant", cval=0.0)
-    if abs(rz_deg) > 1e-8:
-        vol = rotate(vol, angle=rz_deg, axes=(0, 1), reshape=False, order=1, mode="constant", cval=0.0)
+    # Rotation around Y
+    Ry = torch.tensor([
+        [torch.cos(ay), 0, torch.sin(ay)],
+        [0, 1, 0],
+        [-torch.sin(ay), 0, torch.cos(ay)]
+    ], device=device, dtype=torch.float32)
 
-    # Translation (mm to voxels)
-    shift_vox = (
-        tx_mm / spacing[0],
-        ty_mm / spacing[1],
-        tz_mm / spacing[2],
-    )
-    if max(abs(s) for s in shift_vox) > 1e-8:
-        vol = shift(vol, shift=shift_vox, order=1, mode="constant", cval=0.0)
+    # Rotation around Z
+    Rz = torch.tensor([
+        [torch.cos(az), -torch.sin(az), 0],
+        [torch.sin(az), torch.cos(az), 0],
+        [0, 0, 1]
+    ], device=device, dtype=torch.float32)
 
-    # Blur
-    vol = gaussian_filter(vol, sigma=blur_sigma)
+    # Combined Rotation: R = Rz @ Ry @ Rx
+    R = Rz @ Ry @ Rx
 
-    # Project
-    proj = vol.sum(axis=proj_axis)
+    # 3. Translation Normalization (CRITICAL FOR ACCURACY)
+    # Convert mm -> voxels -> normalized [-1, 1] range
+    # Ensure 'spacing' is defined globally (e.g. spacing = [1.0, 1.0, 1.0])
+    tx = (2.0 * pose_params[3] / spacing[0]) / (vol_shape[2] - 1)
+    ty = (2.0 * pose_params[4] / spacing[1]) / (vol_shape[1] - 1)
+    tz = (2.0 * pose_params[5] / spacing[2]) / (vol_shape[0] - 1)
 
-    # Normalize
-    pmin, pmax = proj.min(), proj.max()
-    if pmax - pmin > 1e-8:
-        proj = (proj - pmin) / (pmax - pmin)
-    else:
-        proj = np.zeros_like(proj)
+    # 4. Combine into 3x4 Matrix
+    # PyTorch expects the translation in the last column
+    t = torch.stack([tx, ty, tz]).unsqueeze(1)
+    affine_mat = torch.cat([R, t], dim=1).unsqueeze(0) # Shape (1, 3, 4)
 
-    return proj.astype(np.float32)
+    return affine_mat
+# def build_affine_matrix(pose_params, device):
 
+#     rx, ry, rz = torch.deg2rad(pose_params[0]), torch.deg2rad(pose_params[1]), torch.deg2rad(pose_params[2])
+#     tx, ty, tz = pose_params[3], pose_params[4], pose_params[5]
+
+#     one = torch.ones((), device=device)
+#     zero = torch.zeros((), device=device)
+
+#     Rx = torch.stack([
+#         torch.stack([one, zero, zero]),
+#         torch.stack([zero, torch.cos(rx), -torch.sin(rx)]),
+#         torch.stack([zero, torch.sin(rx), torch.cos(rx)])
+#     ])
+
+#     Ry = torch.stack([
+#         torch.stack([torch.cos(ry), zero, torch.sin(ry)]),
+#         torch.stack([zero, one, zero]),
+#         torch.stack([-torch.sin(ry), zero, torch.cos(ry)])
+#     ])
+
+#     Rz = torch.stack([
+#         torch.stack([torch.cos(rz), -torch.sin(rz), zero]),
+#         torch.stack([torch.sin(rz), torch.cos(rz), zero]),
+#         torch.stack([zero, zero, one])
+#     ])
+
+#     R = Rz @ Ry @ Rx
+
+#     t = torch.stack([tx, ty, tz]).unsqueeze(1)
+
+#     return torch.cat([R, t], dim=1).unsqueeze(0)
+
+def render_at_pose_gpu(volume_tensor, pose_params, proj_axis=0):
+    # ... volume_tensor setup ...
+    if isinstance(volume_tensor, np.ndarray):
+        volume_tensor = torch.from_numpy(volume_tensor).float().to(device)
+    
+    # 2. ENSURE POSE PARAMS ARE TENSORS
+    if isinstance(pose_params, np.ndarray):
+        pose_params = torch.from_numpy(pose_params).float().to(device)
+        
+    if volume_tensor.ndim == 3:
+        volume_tensor = volume_tensor.unsqueeze(0).unsqueeze(0)
+    B, C, D, H, W = volume_tensor.shape
+    
+    # Pass shape to the updated matrix builder
+    affine_mat = build_affine_matrix(pose_params, (D, H, W), volume_tensor.device)
+    
+    grid = F.affine_grid(affine_mat, [B, C, D, H, W], align_corners=False)
+    moved = F.grid_sample(volume_tensor, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+    
+    # Sum along the projection axis (accounting for B and C dims)
+    proj = torch.sum(moved, dim=proj_axis + 2)
+    
+    # Standardize normalization to match CPU's normalize_01
+    p_min, p_max = proj.min(), proj.max()
+    return (proj - p_min) / (p_max - p_min + 1e-8)
 
 def ncc_numpy(a, b, eps=1e-8):
     """Normalized Cross-Correlation (numpy)."""
-    a = a.astype(np.float64).flatten()
-    b = b.astype(np.float64).flatten()
+    a = a.flatten()
+    b = b.flatten()
     a = a - a.mean()
     b = b - b.mean()
     denom = np.sqrt((a*a).sum() * (b*b).sum()) + eps
     return float((a*b).sum() / denom)
+def ncc_torch(a, b, eps=1e-8):
+    # Flatten
+    a = a.reshape(-1)
+    b = b.reshape(-1)
+    # Zero-mean
+    a = a - torch.mean(a)
+    b = b - torch.mean(b)
+    # Correlation
+    return torch.sum(a * b) / (torch.sqrt(torch.sum(a**2) * torch.sum(b**2)) + eps)
+#Q1: compare MI and masked NCC under degraded images.
+def masked_ncc_numpy(a, b, mask=None, eps=1e-8):
+    if mask is None:
+        mask = np.ones_like(a, dtype=bool)
+    av = a[mask].astype(np.float64)
+    bv = b[mask].astype(np.float64)
+    av = av - av.mean()
+    bv = bv - bv.mean()
+    denom = np.sqrt((av * av).sum() * (bv * bv).sum()) + eps
+    return float((av * bv).sum() / denom)
 
 
 # %%
@@ -444,12 +633,12 @@ def render_projection(volume, pose, spacing=(1.0, 1.0, 1.0), proj_axis=0):
     """
     if isinstance(pose, PoseParams):
         pose = pose.as_array()
-    return render_at_pose(volume, pose, spacing, proj_axis)
+    return render_at_pose_gpu(volume, pose, proj_axis)
 
 
 def compute_similarity(pred_image, observed_image, metric="ncc"):
     if metric == "ncc":
-        return ncc_numpy(pred_image, observed_image)
+        return ncc_torch(pred_image, observed_image)
     raise ValueError(f"Unknown metric: {metric}")
 
 
@@ -466,19 +655,6 @@ def make_score_function(problem: RegistrationProblem, metric="ncc"):
     return score_fn
 
 
-# def finite_difference_gradient(score_fn, params, eps_rot=0.1, eps_trans=0.1):
-#     grad = np.zeros(6, dtype=np.float64)
-#     base_score = score_fn(params)
-
-#     for i in range(6):
-#         p = params.copy()
-#         eps = eps_rot if i < 3 else eps_trans
-#         p[i] += eps
-#         grad[i] = (score_fn(p) - base_score) / eps
-
-#     return grad, base_score
-
-# new finite_difference_gradient: less biased and usually much more stable around local optima.
 def finite_difference_gradient(score_fn, params, eps_rot=0.1, eps_trans=0.1, method="central"):
     grad = np.zeros(6, dtype=np.float64)
     base_score = score_fn(params)
@@ -514,99 +690,72 @@ def clip_params(params,
     out[:3] = np.clip(out[:3], rot_bounds[0], rot_bounds[1])
     out[3:] = np.clip(out[3:], trans_bounds[0], trans_bounds[1])
     return out
+def optimize_pose(moving_vol_tensor, observed_img_tensor, init_params, n_iters=100, lr=0.1):
+    """
+    Optimizes pose using PyTorch Autograd and Adam.
+    moving_vol_tensor: (1, 1, D, H, W)
+    observed_img_tensor: (1, 1, H, W)
+    """
+    # 1. Initialize pose on GPU with gradients enabled
+    pose = torch.tensor(init_params, device=device, dtype=torch.float32, requires_grad=True)
+    # observed_img_tensor  = torch.tensor(observed_img_tensor, device=device, dtype=torch.float32)
 
-
-def optimize_pose(score_fn, init_params=None, config=None, verbose=True):
-    if config is None:
-        config = OptimizerConfig()
-
-    if init_params is None:
-        init_params = np.zeros(6, dtype=np.float64)
-
-    params = np.asarray(init_params, dtype=np.float64).copy()
-    velocity = np.zeros(6, dtype=np.float64)
-
-    lrs = np.array([
-        config.lr_rot, config.lr_rot, config.lr_rot,
-        config.lr_trans, config.lr_trans, config.lr_trans
-    ], dtype=np.float64)
-
-    best_score = -float("inf")
-    best_params = params.copy()
+    # 2. Setup Optimizer - Adam is great for handling different units (deg vs mm)
+    optimizer = torch.optim.Adam([pose], lr=lr)
+    
     score_history = []
+    best_score = -1.0
+    best_params = pose.detach().cpu().numpy()
 
-    iterator = tqdm(range(config.n_iters), desc="Register", disable=not verbose)
+    for i in range(n_iters):
+        optimizer.zero_grad()
+        
+        # 3. GPU Rendering
+        # Ensure moving_vol_tensor is on the correct device
+        pred_img = render_at_pose_gpu(moving_vol_tensor, pose, proj_axis=0)
+        # 4. Loss calculation (Minimize 1 - NCC)
+        # We use a 2D NCC. Ensure tensors are (H, W) or (1, 1, H, W)
+        current_ncc = ncc_torch(pred_img, observed_img_tensor)
+        
+        loss = 1.0 - current_ncc
+        
+        # 5. Backprop
+        loss.backward()
+        optimizer.step()
+        
+        # 6. Constrain params (Optional but recommended)
+        with torch.no_grad():
+            pose[:3].clamp_(-15, 15)  # Max 15 degrees
+            pose[3:].clamp_(-20, 20)  # Max 20 mm
 
-    for i in iterator:
-        grad, score = finite_difference_gradient(
-            score_fn=score_fn,
-            params=params,
-            eps_rot=config.eps_rot,
-            eps_trans=config.eps_trans
-        )
-
-        # --- gradient clipping / normalization ---
-        grad_norm = np.linalg.norm(grad)
-        if grad_norm > 1.0:
-            grad = grad / grad_norm
-        # -----------------------------------------
-
-        score_history.append(score)
-
-        if score > best_score:
-            best_score = score
-            best_params = params.copy()
-
-        # decay = 0.98 ** i
-        # current_lrs = lrs * decay
-        # velocity = config.momentum * velocity + current_lrs * grad
-        velocity = config.momentum * velocity + lrs * grad
-        params = params + velocity
-        params = clip_params(params) #new
-
-        if verbose:
-            iterator.set_postfix({
-                "score": f"{score:.4f}",
-                "best": f"{best_score:.4f}"
-            })
-
-        if best_score > 0.99:
-            if verbose:
-                print(f"Converged at iter {i}")
-            break
+        # Record keeping
+        score_history.append(current_ncc)
+        if current_ncc > best_score:
+            best_score = current_ncc
+            best_params = pose.detach().cpu().numpy().copy()
 
     return best_params, best_score, score_history
+def register_single_start(problem: RegistrationProblem, init_pose=None, verbose=True):
+    # Convert inputs to Tensors
+    moving_tensor = torch.from_numpy(problem.moving_volume).float().to(device).unsqueeze(0).unsqueeze(0)
+    obs_tensor = torch.from_numpy(problem.observed_image).float().to(device)
 
-
-def register_single_start(
-    problem: RegistrationProblem,
-    init_pose=None,
-    metric="ncc",
-    optimizer_config=None,
-    verbose=True,
-):
-    if optimizer_config is None:
-        optimizer_config = OptimizerConfig()
-
-    score_fn = make_score_function(problem, metric=metric)
-    init_arr = None if init_pose is None else (
+    init_arr = np.zeros(6, dtype=np.float32) if init_pose is None else (
         init_pose.as_array() if isinstance(init_pose, PoseParams) else np.asarray(init_pose, dtype=np.float32)
     )
 
+    # Use the GPU optimizer
     best_params, best_score, history = optimize_pose(
-        score_fn=score_fn,
-        init_params=init_arr,
-        config=optimizer_config,
-        verbose=verbose,
+        moving_tensor, 
+        obs_tensor, 
+        init_arr, 
+        n_iters=150, 
+        lr=0.1
     )
 
     pred_pose = PoseParams.from_array(best_params)
-    pred_image = render_projection(
-        volume=problem.moving_volume,
-        pose=pred_pose,
-        spacing=problem.spacing,
-        proj_axis=problem.proj_axis,
-    )
+    # Render final result for visualization
+    pred_image = render_at_pose_gpu(moving_tensor, torch.tensor(best_params, device=device))
 
     return RegistrationResult(
         pred_pose=pred_pose,
@@ -614,8 +763,6 @@ def register_single_start(
         best_score=best_score,
         score_history=history,
     )
-
-
 def sample_init_poses(n_restarts=5, seed=42):
     rng = np.random.default_rng(seed)
     poses = [PoseParams()]
@@ -687,53 +834,80 @@ def summarize_pose_error(pred_params, gt_params):
 
 print("Refactored registration API defined.")
 
+# %% [markdown]
+# **<font color='purple'> `multiscale_register` (replace the old `register_single_start`)</font>**
+# 
+# 
+# Because renderer is blur + projection, can stabilize registration by optimizing at several blur/downsample levels.
+# Use three stages:
+# - coarse: downsample 0.25, blur 2.0
+# - medium: downsample 0.5, blur 1.0
+# - fine: full or 0.5, blur 0.5
+
 # %%
 def multiscale_register(problem, metric="ncc", verbose=True):
-    # scales = [
-    #     {"downsample": 0.25, "blur_sigma": 2.0, "n_iters": 80},
-    #     {"downsample": 0.50, "blur_sigma": 1.0, "n_iters": 100},
-    #     {"downsample": 1.00, "blur_sigma": 0.5, "n_iters": 120},
-    # ]
+    '''
+    scales = [
+         {"downsample": 0.25, "blur_sigma": 2.0, "n_iters": 1},
+         {"downsample": 0.50, "blur_sigma": 1.0, "n_iters": 1},
+         {"downsample": 1.00, "blur_sigma": 0.5, "n_iters": 1},
+     ]
+    '''
     scales = [
         {"downsample": 0.25, "blur_sigma": 2.0, "n_iters": 24},
         {"downsample": 0.50, "blur_sigma": 1.0, "n_iters": 30},
         {"downsample": 1.00, "blur_sigma": 0.5, "n_iters": 36},
     ]
 
-    current_pose = PoseParams()
+    # Initial guess
+    current_params = np.zeros(6, dtype=np.float32)
+    
+    # Pre-convert moving volume to tensor once
+    moving_tensor_full = torch.from_numpy(problem.moving_volume).float().to(device).unsqueeze(0).unsqueeze(0)
 
-    for stage_id, stage in enumerate(scales, start=1):
-        moving_ds = maybe_downsample_volume(problem.moving_volume, stage["downsample"])
-        observed_ds = zoom(problem.observed_image, zoom=stage["downsample"], order=1).astype(np.float32)
-        spacing_ds = tuple(s / stage["downsample"] for s in problem.spacing)
+    for stage in scales:
+        # Downsample observed image
+        obs_tensor = problem.observed_image.to(device).unsqueeze(0).unsqueeze(0)
+        if stage["downsample"] < 1.0:
+            obs_ready = F.interpolate(obs_tensor, scale_factor=stage["downsample"], mode='bilinear')
+            # For the volume, downsampling a 3D tensor on GPU:
+            mov_ready = F.interpolate(moving_tensor_full, scale_factor=stage["downsample"], mode='trilinear')
+        else:
+            obs_ready = obs_tensor
+            mov_ready = moving_tensor_full
 
-        stage_problem = RegistrationProblem(
-            moving_volume=moving_ds,
-            observed_image=observed_ds,
-            spacing=spacing_ds,
-            proj_axis=problem.proj_axis,
+        # Run the GPU optimizer
+        current_params, score, history = optimize_pose(
+            mov_ready, 
+            obs_ready.squeeze(), 
+            current_params, 
+            n_iters=stage["n_iters"],
+            lr=0.1
         )
+        
+        if verbose:
+            print(f"Scale {stage['downsample']} finished. Best NCC: {score:.4f}")
 
-        result = register_single_start(
-            problem=stage_problem,
-            init_pose=current_pose,
-            metric=metric,
-            optimizer_config=OptimizerConfig(n_iters=stage["n_iters"]),
-            verbose=verbose,
-        )
-        current_pose = result.pred_pose
+    final_pose = PoseParams.from_array(current_params)
 
-    final_pred = render_projection(
-        volume=problem.moving_volume,
-        pose=current_pose,
-        spacing=problem.spacing,
-        proj_axis=problem.proj_axis,
+    # Render final DRR
+    final_pred = render_at_pose_gpu(
+        moving_tensor_full,
+        torch.tensor(current_params, device=device)
+    )
+
+    # Compute similarity
+    print(type(final_pred),type(problem))
+    best_score = compute_similarity(
+        final_pred,
+        problem.observed_image.to(final_pred.device),
+        metric=metric
     )
 
     return RegistrationResult(
-        pred_pose=current_pose,
+        pred_pose=final_pose,
         pred_image=final_pred,
-        best_score=compute_similarity(final_pred, problem.observed_image, metric=metric),
+        best_score=best_score,
         score_history=[],
     )
 
@@ -863,9 +1037,6 @@ def run_benchmark_cases_single_start(case_dict, moving_model=None, init_params=N
 
     return pd.DataFrame(rows), preds
 
-# %% [markdown]
-# **<font color='purple'> Benchmark Function using `multiscale_register` </font>**
-
 # %%
 # =============================================================================
 # Benchmark Function (DiffPose-Style) using multiscale_register
@@ -888,7 +1059,7 @@ def run_benchmark_cases(case_dict, moving_model=None, init_params=None,
     for case_name, observed_dsa in tqdm(case_dict.items(), desc="Benchmark"):
         problem = RegistrationProblem(
             moving_volume=moving_model,
-            observed_image=observed_dsa,
+            observed_image=torch.from_numpy(observed_dsa).float().to(device),
             spacing=spacing_ds,
             proj_axis=PROJ_AXIS,
         )
@@ -936,11 +1107,11 @@ def run_benchmark_cases(case_dict, moving_model=None, init_params=None,
 # =============================================================================
 
 
-path = "/Users/yanran/Documents/school/CSE291G/Project/TopBrain_Data_Release_Batches1n2_081425"
+path = "TopBrain_Data_Release_Batches1n2_081425"
 #/content/drive/MyDrive/CSE291G
 label_path = Path(path+'/labelsTr_topbrain_ct/')
 input_path = Path(path+'/imagesTr_topbrain_ct/')
-OUT_DIR = Path(path+'/output/'+'/cse291_project_outputs_complete')
+OUT_DIR = Path('output/'+'/cse291_project_outputs_complete')
 OUT_DIR.mkdir(exist_ok=True, parents=True)
 for index in range(27):
     index_str = f"{index+1:03}"
@@ -950,13 +1121,16 @@ for index in range(27):
     label_name = f"topcow_ct_{index_str}.nii"
     CT_PATH = input_path/ct_name
     LABEL_PATH = label_path/label_name
-    with gzip.open(input_path/ct_zipped_name, 'rb') as f_in:
-        with open(CT_PATH, 'wb') as f_out:
-            shutil.copyfileobj(f_in, f_out)
-    with gzip.open(label_path/label_zipped_name, 'rb') as f_in:
-        with open(LABEL_PATH, 'wb') as f_out:
-            shutil.copyfileobj(f_in, f_out)
-
+    try:
+        with gzip.open(input_path/ct_zipped_name, 'rb') as f_in:
+            with open(CT_PATH, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        with gzip.open(label_path/label_zipped_name, 'rb') as f_in:
+            with open(LABEL_PATH, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+    except FileNotFoundError:
+        print(f"file not found, skipping.")
+        continue  
     print('CT_PATH   =', CT_PATH)
     print('LABEL_PATH=', LABEL_PATH)
     print('OUT_DIR   =', OUT_DIR)
@@ -1136,13 +1310,15 @@ for index in range(27):
 
     print("Running registration on baseline...")
     print(f"Ground truth params: {T_gt}")
-
+    # healthy_binary_ds = torch.from_numpy(healthy_binary_ds).float().to(device)
+    # T_gt = torch.from_numpy(T_gt).float().to(device)
     # First verify rendering matches
-    test_render = render_at_pose(healthy_binary_ds, T_gt, spacing_ds, PROJ_AXIS)
-    match_ncc = ncc_numpy(test_render, baseline_dsa_obs)
+    test_render = render_at_pose_gpu(healthy_binary_ds, T_gt, PROJ_AXIS)
+    baseline_dsa_obs  = torch.tensor(baseline_dsa_obs, device=device, dtype=torch.float32)
+    match_ncc = ncc_torch(test_render, baseline_dsa_obs)
     print(f"Verification - NCC between GT render and observed: {match_ncc:.6f}")
     print("(Should be ~1.0 if rendering matches)")
-
+    '''
     baseline_problem = RegistrationProblem(
         moving_volume=healthy_binary_ds,
         observed_image=baseline_dsa_obs,
@@ -1191,6 +1367,7 @@ for index in range(27):
 
     plt.tight_layout()
     # plt.show()
+    '''
     print("Running Q1 Gaussian noise benchmark (DiffPose)...")
 
     q1_gaussian_table, q1_gaussian_preds = run_benchmark_cases(
@@ -1273,10 +1450,9 @@ for index in range(27):
     ])
 
     # Save to CSV
-    output_csv = OUT_DIR / 'diffpose_registration_results.csv'
+    output_csv = OUT_DIR / f'{index_str}_diffpose_registration_results.csv'
     all_results.to_csv(output_csv, index=False)
-    print(f"\nResults saved to {index_str+output_csv}")
-
+    print(f"\nResults saved to {str(output_csv)}")
     # %%
     # =============================================================================
     # Visualization: Registration Error vs Condition
@@ -1309,8 +1485,9 @@ for index in range(27):
     ax.tick_params(axis='x', rotation=45)
 
     plt.tight_layout()
-    plt.savefig(OUT_DIR / 'registration_errors_diffpose.png', dpi=150, bbox_inches='tight')
+    plt.savefig(OUT_DIR / f'{index_str}_registration_errors_diffpose.png', dpi=150, bbox_inches='tight')
     # plt.show()
 
     print(f"Figure saved to {OUT_DIR}/{index_str}_registration_errors_diffpose.png")
+
 
