@@ -381,16 +381,6 @@ def ncc_numpy(a, b, eps=1e-8):
     denom = np.sqrt((a*a).sum() * (b*b).sum()) + eps
     return float((a*b).sum() / denom)
 
-#Q1: compare MI and masked NCC under degraded images.
-def masked_ncc_numpy(a, b, mask=None, eps=1e-8):
-    if mask is None:
-        mask = np.ones_like(a, dtype=bool)
-    av = a[mask].astype(np.float64)
-    bv = b[mask].astype(np.float64)
-    av = av - av.mean()
-    bv = bv - bv.mean()
-    denom = np.sqrt((av * av).sum() * (bv * bv).sum()) + eps
-    return float((av * bv).sum() / denom)
 
 # %%
 from dataclasses import dataclass
