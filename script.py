@@ -59,9 +59,12 @@ import nibabel as nib
 import matplotlib.pyplot as plt
 import gzip
 import shutil
+from PIL import Image
+
 
 from scipy.ndimage import gaussian_filter, rotate, shift, zoom
 from scipy.optimize import minimize
+import os
 
 # %%
 
@@ -1515,6 +1518,8 @@ def run_benchmark_cases(case_dict, moving_model=None, init_params=None,
 
     rows = []
     preds = {}
+    save_dir = OUT_DIR/Path(index_str)
+    os.makedirs(save_dir, exist_ok=True)
 
     for case_name, observed_dsa in tqdm(case_dict.items(), desc="Benchmark"):
         problem = RegistrationProblem(
@@ -1538,6 +1543,17 @@ def run_benchmark_cases(case_dict, moving_model=None, init_params=None,
               metric=metric,
               verbose=False,
           )
+        
+        img = reg.pred_image
+        if np.max(img) <= 1.0:  # normalize if needed
+            img = (img * 255).astype(np.uint8)
+        else:
+            img = img.astype(np.uint8)
+        save_path = os.path.join(save_dir, f"{case_name}_reg.png")
+        im = Image.fromarray(img)
+        im.save(save_dir / f"{case_name}_reg.png")
+
+
 
         param_err = summarize_pose_error(reg.pred_pose, T_gt)
         mtre = compute_mtre(reg.pred_pose, T_gt, target_points_ijk, spacing_ds)
@@ -1567,7 +1583,7 @@ def run_benchmark_cases(case_dict, moving_model=None, init_params=None,
 # =============================================================================
 
 
-path = "/Users/yanran/Documents/school/CSE291G/Project/TopBrain_Data_Release_Batches1n2_081425"
+path = "TopBrain_Data_Release_Batches1n2_081425"
 #/content/drive/MyDrive/CSE291G
 label_path = Path(path+'/labelsTr_topbrain_ct/')
 input_path = Path(path+'/imagesTr_topbrain_ct/')
@@ -1730,7 +1746,7 @@ for index in range(27):
         healthy_binary_ds, T_gt, proj_axis=PROJ_AXIS, blur_sigma=1.0, spacing=spacing_ds
     )
 
-    GAUSSIAN_SIGMAS = [0.01, 0.05, 0.10]
+    GAUSSIAN_SIGMAS = [0.0, 0.01, 0.03, 0.05, 0.10]
     POISSON_PEAKS = [20, 40, 80]
 
     q1_gaussian_dsas = {sigma: add_gaussian_noise(baseline_dsa_obs, sigma=sigma, seed=42) for sigma in GAUSSIAN_SIGMAS}
@@ -1940,7 +1956,7 @@ for index in range(27):
     ax.tick_params(axis='x', rotation=45)
 
     plt.tight_layout()
-    plt.savefig(OUT_DIR / '{index_str}_registration_errors_diffpose.png', dpi=150, bbox_inches='tight')
+    plt.savefig(OUT_DIR / f'{index_str}_registration_errors_diffpose.png', dpi=150, bbox_inches='tight')
     # plt.show()
 
     print(f"Figure saved to {OUT_DIR}/{index_str}_registration_errors_diffpose.png")
