@@ -431,7 +431,7 @@ def remove_random_vessel_volume(binary_mask, removal_fraction, seed=0):
         out[voxels[:, 0], voxels[:, 1], voxels[:, 2]] = 0
     return out
 
-VOLUME_LOSS_LEVELS = [0.10, 0.50, 0.80]
+VOLUME_LOSS_LEVELS = [0.10, 0.50, 0.80,0.95]
 
 
 # plt.show()
@@ -1597,12 +1597,16 @@ for index in range(27):
     label_name = f"topcow_ct_{index_str}.nii"
     CT_PATH = input_path/ct_name
     LABEL_PATH = label_path/label_name
-    with gzip.open(input_path/ct_zipped_name, 'rb') as f_in:
-        with open(CT_PATH, 'wb') as f_out:
-            shutil.copyfileobj(f_in, f_out)
-    with gzip.open(label_path/label_zipped_name, 'rb') as f_in:
-        with open(LABEL_PATH, 'wb') as f_out:
-            shutil.copyfileobj(f_in, f_out)
+    try:
+        with gzip.open(input_path/ct_zipped_name, 'rb') as f_in:
+            with open(CT_PATH, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        with gzip.open(label_path/label_zipped_name, 'rb') as f_in:
+            with open(LABEL_PATH, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+    except FileNotFoundError:
+        print("FileNotFoundError", input_path/ct_zipped_name ,"or", input_path/ct_zipped_name) 
+        continue
 
     print('CT_PATH   =', CT_PATH)
     print('LABEL_PATH=', LABEL_PATH)
@@ -1960,5 +1964,3 @@ for index in range(27):
     # plt.show()
 
     print(f"Figure saved to {OUT_DIR}/{index_str}_registration_errors_diffpose.png")
-
-
