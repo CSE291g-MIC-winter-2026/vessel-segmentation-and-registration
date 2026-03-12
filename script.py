@@ -1567,7 +1567,7 @@ def run_benchmark_cases(case_dict, moving_model=None, init_params=None,
 # =============================================================================
 
 
-path = "TopBrain_Data_Release_Batches1n2_081425"
+path = "/Users/yanran/Documents/school/CSE291G/Project/TopBrain_Data_Release_Batches1n2_081425"
 #/content/drive/MyDrive/CSE291G
 label_path = Path(path+'/labelsTr_topbrain_ct/')
 input_path = Path(path+'/imagesTr_topbrain_ct/')
@@ -1906,7 +1906,7 @@ for index in range(27):
     # Save to CSV
     output_csv = OUT_DIR / f'{index_str}_diffpose_registration_results.csv'
     all_results.to_csv(output_csv, index=False)
-    print(f"\nResults saved to {index_str}_diffpose_registration_results.csv")
+    print(f"\nResults saved to {output_csv}")
 
     # %%
     # =============================================================================
@@ -1940,7 +1940,7 @@ for index in range(27):
     ax.tick_params(axis='x', rotation=45)
 
     plt.tight_layout()
-    plt.savefig(OUT_DIR / f'{index_str}_registration_errors_diffpose.png', dpi=150, bbox_inches='tight')
+    plt.savefig(OUT_DIR / '{index_str}_registration_errors_diffpose.png', dpi=150, bbox_inches='tight')
     # plt.show()
 
     print(f"Figure saved to {OUT_DIR}/{index_str}_registration_errors_diffpose.png")
