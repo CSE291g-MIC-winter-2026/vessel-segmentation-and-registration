@@ -1,55 +1,3 @@
-# %% [markdown]
-# 
-# # To start
-# 1. download the dataset: https://topbrain2025.grand-challenge.org/data/
-# 2. store the dataset in your google drive folder  `CSE291G`, inside the folder you should have two folders
-# `labelsTr_topbrain_ct/topcow_ct_001_0000.nii.gz"`
-# and
-# `imagesTr_topbrain_ct/topcow_ct_001.nii.gz"`
-# 3. then select GPU in google colab under `notebook setting`
-# 
-
-# %% [markdown]
-# 
-# 
-# #<font color="red"> **The following code is applied to 1 single patient CTA. But we can reuse this code later as python file to process all 29 patient in registration pipeline**</font>
-# 
-# 
-# DiffDRR: https://github.com/eigenvivek/DiffDRR
-# paper: https://arxiv.org/pdf/2208.12737
-# 
-# 
-# DiffPose:  https://github.com/eigenvivek/DiffPose
-# 
-# 
-# It does these steps:
-# 
-# 1. Load the **CTA image** and **multiclass vessel label map**
-# 2. Understand label IDs present in the case
-# 3. <font color="red"> Keep only the **healthy hemisphere** THIS PART IS UNSURE PLEASE CHECK THE CODE</font>
-# 4. Build controlled perturbations:
-#    - **Q1**: image noise after 2D projection
-#    - **Q2**: random vessel-volume loss
-#    - **Q3**: removal of proximal / medium / distal vessel groups
-# 5. Generate a **projection-based pseudo-DSA** for debugging the pipeline
-# 6. Save outputs for later registration experiments
-# 
-# ## Files used
-# 
-# - `topcow_ct_001_0000.nii.gz` → CTA image volume
-# - `topcow_ct_001.nii.gz` → vessel label map
-# 
-
-# %%
-
-# Uncomment once if needed
-# %pip install nibabel matplotlib scipy pandas
-
-
-
-
-# %%
-
 from pathlib import Path
 import json
 import math
@@ -1089,7 +1037,6 @@ def make_score_function(problem: RegistrationProblem, metric="ncc"):
         return compute_similarity(pred, problem.observed_image, metric=metric)
     return score_fn
 
-
 # def finite_difference_gradient(score_fn, params, eps_rot=0.1, eps_trans=0.1):
 #     grad = np.zeros(6, dtype=np.float64)
 #     base_score = score_fn(params)
@@ -1589,7 +1536,7 @@ label_path = Path(path+'/labelsTr_topbrain_ct/')
 input_path = Path(path+'/imagesTr_topbrain_ct/')
 OUT_DIR = Path(path+'/output/'+'/cse291_project_outputs_complete')
 OUT_DIR.mkdir(exist_ok=True, parents=True)
-for index in range(27):
+for index in range(10):
     index_str = f"{index+1:03}"
     ct_zipped_name = f"topcow_ct_{index_str}_0000.nii.gz"
     label_zipped_name = f"topcow_ct_{index_str}.nii.gz"
@@ -1726,8 +1673,13 @@ for index in range(27):
         ax.axis('off')
     plt.tight_layout()
     # plt.show()
+    #option1: random pose
     T_gt = sample_random_rigid_params(seed=42)
+    #option2: naive pose
+    T_gt = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
     print("T_gt [rx, ry, rz, tx, ty, tz] =", T_gt)
+    
 
     # %%
 
@@ -1789,70 +1741,70 @@ for index in range(27):
     print(f"Ground truth params: {T_gt}")
 
     # First verify rendering matches
-    test_render = render_at_pose(healthy_binary_ds, T_gt, spacing_ds, PROJ_AXIS)
-    match_ncc = ncc_numpy(test_render, baseline_dsa_obs)
-    print(f"Verification - NCC between GT render and observed: {match_ncc:.6f}")
-    print("(Should be ~1.0 if rendering matches)")
+    # test_render = render_at_pose(healthy_binary_ds, T_gt, spacing_ds, PROJ_AXIS)
+    # match_ncc = ncc_numpy(test_render, baseline_dsa_obs)
+    # print(f"Verification - NCC between GT render and observed: {match_ncc:.6f}")
+    # print("(Should be ~1.0 if rendering matches)")
 
-    baseline_problem = RegistrationProblem(
-        moving_volume=healthy_binary_ds,
-        observed_image=baseline_dsa_obs,
-        spacing=spacing_ds,
-        proj_axis=PROJ_AXIS,
-    )
+    # baseline_problem = RegistrationProblem(
+    #     moving_volume=healthy_binary_ds,
+    #     observed_image=baseline_dsa_obs,
+    #     spacing=spacing_ds,
+    #     proj_axis=PROJ_AXIS,
+    # )
 
-    baseline_reg = register_multistart(
-        problem=baseline_problem,
-        n_restarts=1,
-        metric="ncc",
-        optimizer_config=OptimizerConfig(n_iters=100),
-        verbose=True,
-    )
+    # baseline_reg = register_multistart(
+    #     problem=baseline_problem,
+    #     n_restarts=1,
+    #     metric="ncc",
+    #     optimizer_config=OptimizerConfig(n_iters=100),
+    #     verbose=True,
+    # )
 
-    baseline_err = summarize_pose_error(baseline_reg.pred_pose, T_gt)
+    # baseline_err = summarize_pose_error(baseline_reg.pred_pose, T_gt)
 
-    print("\n" + "=" * 60)
-    print("BASELINE REGISTRATION RESULTS")
-    print("=" * 60)
-    print(f"GT params       : {T_gt}")
-    print(f"Recovered params: {baseline_reg.pred_pose.as_array()}")
-    print(f"Best NCC        : {baseline_reg.best_score:.4f}")
-    print(f"Rotation error (deg): {baseline_err['rot_err_deg_l2']:.4f}")
-    print(f"Translation error (mm): {baseline_err['trans_err_mm_l2']:.4f}")
+    # print("\n" + "=" * 60)
+    # print("BASELINE REGISTRATION RESULTS")
+    # print("=" * 60)
+    # print(f"GT params       : {T_gt}")
+    # print(f"Recovered params: {baseline_reg.pred_pose.as_array()}")
+    # print(f"Best NCC        : {baseline_reg.best_score:.4f}")
+    # print(f"Rotation error (deg): {baseline_err['rot_err_deg_l2']:.4f}")
+    # print(f"Translation error (mm): {baseline_err['trans_err_mm_l2']:.4f}")
 
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    # fig, axes = plt.subplots(1, 4, figsize=(16, 4))
 
-    axes[0].imshow(baseline_dsa_obs, cmap="gray")
-    axes[0].set_title("Observed DSA\n(Ground Truth)")
-    axes[0].axis("off")
+    # axes[0].imshow(baseline_dsa_obs, cmap="gray")
+    # axes[0].set_title("Observed DSA\n(Ground Truth)")
+    # axes[0].axis("off")
 
-    axes[1].imshow(baseline_reg.pred_image, cmap="gray")
-    axes[1].set_title(f"Recovered\nNCC={baseline_reg.best_score:.3f}")
-    axes[1].axis("off")
+    # axes[1].imshow(baseline_reg.pred_image, cmap="gray")
+    # axes[1].set_title(f"Recovered\nNCC={baseline_reg.best_score:.3f}")
+    # axes[1].axis("off")
 
-    axes[2].imshow(np.abs(baseline_dsa_obs - baseline_reg.pred_image), cmap="hot")
-    axes[2].set_title("Difference")
-    axes[2].axis("off")
+    # axes[2].imshow(np.abs(baseline_dsa_obs - baseline_reg.pred_image), cmap="hot")
+    # axes[2].set_title("Difference")
+    # axes[2].axis("off")
 
-    axes[3].plot(baseline_reg.score_history)
-    axes[3].set_xlabel("Iteration")
-    axes[3].set_ylabel("NCC")
-    axes[3].set_title("Convergence")
-    axes[3].grid(True)
+    # axes[3].plot(baseline_reg.score_history)
+    # axes[3].set_xlabel("Iteration")
+    # axes[3].set_ylabel("NCC")
+    # axes[3].set_title("Convergence")
+    # axes[3].grid(True)
 
-    plt.tight_layout()
-    # plt.show()
-    print("Running Q1 Gaussian noise benchmark (DiffPose)...")
+    # plt.tight_layout()
+    # # plt.show()
+    # print("Running Q1 Gaussian noise benchmark (DiffPose)...")
 
-    q1_gaussian_table, q1_gaussian_preds = run_benchmark_cases(
-        {f"sigma_{sigma}": img for sigma, img in q1_gaussian_dsas.items()},
-        #n_iters=3, #150
-        verbose=False,
-    )
+    # q1_gaussian_table, q1_gaussian_preds = run_benchmark_cases(
+    #     {f"sigma_{sigma}": img for sigma, img in q1_gaussian_dsas.items()},
+    #     #n_iters=3, #150
+    #     verbose=False,
+    # )
 
-    print("\nQ1 Gaussian Noise Results:")
-    print(q1_gaussian_table.to_string(index=False))
-    q1_gaussian_table
+    # print("\nQ1 Gaussian Noise Results:")
+    # print(q1_gaussian_table.to_string(index=False))
+    # q1_gaussian_table
 
     # %%
     # =============================================================================
@@ -1876,91 +1828,33 @@ for index in range(27):
     # Q3: Vessel Group Removal Benchmark
     # =============================================================================
 
-    print("Running Q3 vessel group removal benchmark (DiffPose)...")
+    # print("Running Q3 vessel group removal benchmark (DiffPose)...")
 
-    q3_table, q3_preds = run_benchmark_cases(
-        q3_dsas_obs,
-        #n_iters=3,
-        verbose=False,
-    )
+    # q3_table, q3_preds = run_benchmark_cases(
+    #     q3_dsas_obs,
+    #     #n_iters=3,
+    #     verbose=False,
+    # )
 
-    print("\nQ3 Vessel Group Removal Results:")
-    print(q3_table.to_string(index=False))
-    q3_table
+    # print("\nQ3 Vessel Group Removal Results:")
+    # print(q3_table.to_string(index=False))
+    # q3_table
 
     # %%
     # =============================================================================
     # Summary Results
     # =============================================================================
 
-    print("="*70)
-    print("BENCHMARK SUMMARY - DiffPose Registration")
-    print("="*70)
-
-    print("\n" + "-"*70)
-    print("Q1: Gaussian Noise (noise added after projection)")
-    print("-"*70)
-    print(q1_gaussian_table.to_string(index=False))
-
-    print("\n" + "-"*70)
-    print("Q2: Random Vessel Volume Loss")
-    print("-"*70)
-    print(q2_table.to_string(index=False))
-
-    print("\n" + "-"*70)
-    print("Q3: Vessel Group Removal (proximal/medium/distal)")
-    print("-"*70)
-    print(q3_table.to_string(index=False))
-
-    print("\n" + "="*70)
-    print(f"Ground Truth Pose: {T_gt}")
-    print("="*70)
-
     # Combine all results
     all_results = pd.concat([
-        q1_gaussian_table.assign(experiment='Q1_gaussian'),
+        # q1_gaussian_table.assign(experiment='Q1_gaussian'),
         q2_table.assign(experiment='Q2_volume_loss'),
-        q3_table.assign(experiment='Q3_group_removal'),
+        # q3_table.assign(experiment='Q3_group_removal'),
     ])
 
     # Save to CSV
-    output_csv = OUT_DIR / f'{index_str}_diffpose_registration_results.csv'
+    output_csv = OUT_DIR / f'{index_str}_extraQ2_diffpose_registration_results.csv'
     all_results.to_csv(output_csv, index=False)
     print(f"\nResults saved to {output_csv}")
 
-    # %%
-    # =============================================================================
-    # Visualization: Registration Error vs Condition
-    # =============================================================================
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-
-    # Q1: Noise
-    ax = axes[0]
-    ax.bar(q1_gaussian_table['case'], q1_gaussian_table['trans_err_mm_l2'])
-    ax.set_xlabel('Noise Level')
-    ax.set_ylabel('Translation Error (mm)')
-    ax.set_title('Q1: Effect of Gaussian Noise')
-    ax.tick_params(axis='x', rotation=45)
-
-    # Q2: Volume Loss
-    ax = axes[1]
-    ax.bar(q2_table['case'], q2_table['trans_err_mm_l2'])
-    ax.set_xlabel('Volume Loss')
-    ax.set_ylabel('Translation Error (mm)')
-    ax.set_title('Q2: Effect of Vessel Volume Loss')
-    ax.tick_params(axis='x', rotation=45)
-
-    # Q3: Group Removal
-    ax = axes[2]
-    ax.bar(q3_table['case'], q3_table['trans_err_mm_l2'])
-    ax.set_xlabel('Removed Group')
-    ax.set_ylabel('Translation Error (mm)')
-    ax.set_title('Q3: Effect of Vessel Group Removal')
-    ax.tick_params(axis='x', rotation=45)
-
-    plt.tight_layout()
-    plt.savefig(OUT_DIR / f'{index_str}_registration_errors_diffpose.png', dpi=150, bbox_inches='tight')
-    # plt.show()
-
-    print(f"Figure saved to {OUT_DIR}/{index_str}_registration_errors_diffpose.png")
+   
