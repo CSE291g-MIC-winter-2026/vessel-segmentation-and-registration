@@ -2,6 +2,8 @@
 
 ### script.py
 
+#### what it does?
+
 This script moves our pipeline from CPU to GPU. On top of the Registration_GPU_multiscale.ipynb, this script adds 2D-3D medical image registration to align a 3D volume to a 2D projection. It mimics the high-level strategy of DiffPose with finite differences instead of the deep-learning "differentiable" backbone. This script also connects the process of building synthetic data -> registaion -> evalutaion on the TopBrain 2025 dataset.
 
 1. The Renderer (render_at_pose): This is the "forward model." It takes a 3D volume, applies 3D rotations and translations, blurs it to simulate camera effects, and then sums the voxels along one axis to create a 2D "pseudo-X-ray."
@@ -14,6 +16,11 @@ This script moves our pipeline from CPU to GPU. On top of the Registration_GPU_m
 
 5. Evaluation (compute_mtre): It calculates the Mean Target Registration Error (mTRE) in millimeters to see how far the final prediction is from the actual ground truth.
 
+#### how to run?
+- download the dataset: https://topbrain2025.grand-challenge.org/data/
+- store the dataset (`TopBrain_Data_Release_Batches1n2_081425`) in the same directory as `script.py`.
+- Then you can run it by `python script.py`
+
 ### hypothesis_test.ipynb
 #### what it does?
 - The notebook conducts statistical tests and generates visualizations for our three research questions.
@@ -22,7 +29,7 @@ This script moves our pipeline from CPU to GPU. On top of the Registration_GPU_m
 - run `scripts.py` to obtain data or download our output directly
   - output for naive pose: https://drive.google.com/drive/folders/1_plTyqcXWF07xpHGColF8AJ1Qup8V9fi?usp=share_link
   - output for random pose: https://drive.google.com/drive/folders/1GIiUNc07UaCogEUOgb1xYzRXoxkzXXgs?usp=share_link
-- put data into a folder named `data` and run the notebook directly
+- put data into a folder named `data` in the same directory as the notebook and you can run it directly
 
 ### Registration_mTRE_multiscale.ipynb
 #### what it does?
