@@ -13,3 +13,22 @@ This script moves our pipeline from CPU to GPU. On top of the Registration_GPU_m
 4. Multiscale Strategy (multiscale_register): To prevent getting stuck in local errors, it runs the optimization in three stages: Coarse (Low resolution, high blur), Medium (Mid resolution, mid blur), Fine (High resolution, low blur).
 
 5. Evaluation (compute_mtre): It calculates the Mean Target Registration Error (mTRE) in millimeters to see how far the final prediction is from the actual ground truth.
+
+### hypothesis_test.ipynb
+#### what it does?
+- The notebook conducts statistical tests and generates visualizations for our three research questions.
+
+#### how to run?
+- run `scripts.py` to obtain data or download our output directly
+  - output for naive pose: https://drive.google.com/drive/folders/1_plTyqcXWF07xpHGColF8AJ1Qup8V9fi?usp=share_link
+  - output for random pose: https://drive.google.com/drive/folders/1GIiUNc07UaCogEUOgb1xYzRXoxkzXXgs?usp=share_link
+- put data into a folder named `data` and run the notebook directly
+
+### Registration_mTRE_multiscale.ipynb
+#### what it does?
+- The notebook show our data preprocessing process with a single patient's CTA. It visualizes the DSA we sythesized. 
+
+#### how to run?
+- download the dataset: https://topbrain2025.grand-challenge.org/data/
+- store the dataset in your google drive folder `CSE291G`, inside the folder you should have two folders `labelsTr_topbrain_ct/topcow_ct_001_0000.nii.gz` and `imagesTr_topbrain_ct/topcow_ct_001.nii.gz`
+- Then you can run the notebook to see our data exploration process and how we generated sythetic DSA images.
